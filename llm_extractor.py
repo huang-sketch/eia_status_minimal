@@ -156,8 +156,12 @@ def evidence_is_supported(record: Dict[str, Any], chunk_text: str) -> bool:
     if evidence_norm and evidence_norm in chunk_norm:
         return True
 
-    numbers = unique(NUMBER_RE.findall(evidence))
-    units = unique(match.group(0) for match in UNIT_RE.finditer(evidence))
+    numbers = unique(NUMBER_RE.findall(str(record.get("value") or "")))
+    if not numbers:
+        numbers = meaningful_numbers(evidence)
+    units = unique([str(record.get("unit") or "")])
+    if not units:
+        units = unique(match.group(0) for match in UNIT_RE.finditer(evidence))
     keywords = evidence_keywords(evidence, record)
 
     number_hits = sum(1 for number in numbers if normalize_text(number) in chunk_norm)
@@ -169,6 +173,18 @@ def evidence_is_supported(record: Dict[str, Any], chunk_text: str) -> bool:
     has_keyword_support = keyword_hits >= min(2, len(keywords)) if keywords else True
 
     return has_value_support and has_unit_support and has_keyword_support
+
+
+def meaningful_numbers(text: str) -> List[str]:
+    numbers: List[str] = []
+    for match in NUMBER_RE.finditer(text):
+        start, end = match.span()
+        before = text[start - 1] if start > 0 else ""
+        after = text[end] if end < len(text) else ""
+        if before.isalnum() or after.isalnum():
+            continue
+        numbers.append(match.group(0))
+    return unique(numbers)
 
 
 def normalize_text(text: str) -> str:
