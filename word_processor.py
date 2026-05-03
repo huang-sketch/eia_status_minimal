@@ -24,6 +24,7 @@ def load_docx_chunks(path: Path) -> List[Dict[str, Any]]:
     chunks: List[Dict[str, Any]] = []
 
     paragraph_buffer: List[str] = []
+    recent_paragraphs: List[str] = []
     paragraph_start_index = 0
     block_index = 0
     table_index = 0
@@ -61,6 +62,8 @@ def load_docx_chunks(path: Path) -> List[Dict[str, Any]]:
                 paragraph_start_index = block_index
 
             paragraph_buffer.append(text)
+            recent_paragraphs.append(text)
+            recent_paragraphs[:] = recent_paragraphs[-3:]
             block_index += 1
             continue
 
@@ -68,12 +71,20 @@ def load_docx_chunks(path: Path) -> List[Dict[str, Any]]:
 
         table_text = table_to_text(block)
         if table_text.strip():
+            row_count, col_counts, empty_cell_count = table_shape(block)
             chunks.append(
                 {
                     "chunk_id": f"{path.name}:table:{table_index}",
                     "source_file": str(path),
                     "kind": "table",
                     "text": table_text,
+                    "metadata": {
+                        "table_title": recent_paragraphs[-1] if recent_paragraphs else None,
+                        "context_before": "\n".join(recent_paragraphs),
+                        "row_count": row_count,
+                        "col_counts": col_counts,
+                        "empty_cell_count": empty_cell_count,
+                    },
                 }
             )
 
@@ -103,6 +114,16 @@ def table_to_text(table: Any) -> str:
             ]
             rows.append(f"row {row_index + 1}: " + " | ".join(rendered))
     return "\n".join(rows)
+
+
+def table_shape(table: Any) -> tuple[int, List[int], int]:
+    col_counts: List[int] = []
+    empty_cell_count = 0
+    for row in table.rows:
+        cells = row_to_cells(row)
+        col_counts.append(len(cells))
+        empty_cell_count += sum(1 for cell in cells if not cell)
+    return len(table.rows), col_counts, empty_cell_count
 
 
 def row_to_cells(row: Any) -> List[str]:
