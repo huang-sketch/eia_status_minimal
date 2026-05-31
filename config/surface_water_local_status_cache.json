@@ -1,0 +1,318 @@
+{
+  "name": "surface_water_local_status_cache",
+  "version": 3,
+  "description": "地表水区域环境质量现状公报缓存库。优先缓存县级市/区县，其次地级市、省级；文本必须来自公开公报或政府/生态环境主管部门公开信息。",
+  "updated_at": "2026-05-30",
+  "matching_policy": {
+    "primary": "行政区划匹配精度优先：完整行政区划、县级市/区县、地级市、省级依次降级。",
+    "secondary": "同一匹配精度下使用最新年份。",
+    "fallback": "联网检索无可用结果时才使用本缓存；缓存仍无命中则不生成公报段落，避免编造。"
+  },
+  "item_schema": {
+    "admin_division": "规范行政区划全称，建议到县级市/区县。",
+    "province": "省级行政区。",
+    "city": "地级市。",
+    "county": "县、区或县级市。",
+    "admin_division_aliases": "可匹配别名，包含全称、上级+本级、本级简称。",
+    "admin_level": "province/city/county/county_city/district。",
+    "year": "公报年份。",
+    "source_name": "公报或公开信息名称。",
+    "source_url": "来源网页地址。",
+    "text": "可直接写入报告的区域地表水环境质量现状段落。"
+  },
+  "items": [
+    {
+      "admin_division": "江苏省",
+      "province": "江苏省",
+      "city": "",
+      "county": "",
+      "admin_division_aliases": [
+        "江苏省",
+        "江苏"
+      ],
+      "admin_level": "province",
+      "year": 2024,
+      "source_name": "2024年江苏省生态环境状况公报",
+      "source_url": "https://www.jiangsu.gov.cn/art/2025/6/27/art_46548_325.html",
+      "text": "根据《2024年江苏省生态环境状况公报》，2024年，江苏省地表水国考断面水质优于Ⅲ类比例达到93.8%，地表水国考断面连续3年达到优级水质，无水质劣于Ⅴ类断面；长江干流江苏段水质连续7年保持Ⅱ类，太湖连续17年实现安全度夏，达到国家良好湖泊水平，全省水环境质量总体保持优级水平。"
+    },
+    {
+      "admin_division": "江苏省南京市",
+      "province": "江苏省",
+      "city": "南京市",
+      "county": "",
+      "admin_division_aliases": [
+        "江苏省南京市",
+        "南京市",
+        "南京"
+      ],
+      "admin_level": "city",
+      "year": 2024,
+      "source_name": "2024年南京市生态环境状况公报",
+      "source_url": "https://sthjj.nanjing.gov.cn/njshjbhj/202503/t20250305_5088369.html",
+      "text": "根据《2024年南京市生态环境状况公报》，2024年，南京市水环境质量总体良好，纳入江苏省“十四五”水环境考核目标的42个地表水断面水质优良率为100%，无丧失使用功能的劣Ⅴ类断面，国省考断面连续6年优良率保持100%，主要集中式饮用水水源地水质持续优良。"
+    },
+    {
+      "admin_division": "江苏省无锡市",
+      "province": "江苏省",
+      "city": "无锡市",
+      "county": "",
+      "admin_division_aliases": [
+        "江苏省无锡市",
+        "无锡市",
+        "无锡"
+      ],
+      "admin_level": "city",
+      "year": 2024,
+      "source_name": "2024年度无锡市生态环境状况公报",
+      "source_url": "https://www.wuxi.gov.cn/doc/2025/06/03/4584725.shtml",
+      "text": "根据《2024年度无锡市生态环境状况公报》，2024年，无锡市地表水环境质量持续改善，国省考断面优Ⅲ比例保持较高水平，太湖无锡水域水质实现由Ⅳ类到Ⅲ类的提升，长江干流无锡段水质连续保持Ⅱ类，县级及以上城市集中式饮用水水源地水质保持稳定。"
+    },
+    {
+      "admin_division": "江苏省徐州市",
+      "province": "江苏省",
+      "city": "徐州市",
+      "county": "",
+      "admin_division_aliases": [
+        "江苏省徐州市",
+        "徐州市",
+        "徐州"
+      ],
+      "admin_level": "city",
+      "year": 2024,
+      "source_name": "2024年徐州市生态环境状况公报",
+      "source_url": "",
+      "text": "根据《2024年徐州市生态环境状况公报》，2024年，全市45个国省考断面优Ⅲ比例达97.8%，17个国考断面优Ⅲ比例为94.1%，提前、超额完成“十四五”目标任务。县级以上集中式饮用水水源水质优Ⅲ比例保持100%。在用市级地表水集中式饮用水水源地（骆马湖窑湾和小沿河水源地）水质稳定达到Ⅲ类标准，水质达标率为100%。市区主要水体水质均达到功能区划要求，其中京杭运河（徐州段）河流水质状况为优，废黄河、奎河水质状况为良好，云龙湖、南水北调东线（徐州段）水质均达标。"
+    },
+    {
+      "admin_division": "江苏省常州市",
+      "province": "江苏省",
+      "city": "常州市",
+      "county": "",
+      "admin_division_aliases": [
+        "江苏省常州市",
+        "常州市",
+        "常州"
+      ],
+      "admin_level": "city",
+      "year": 2024,
+      "source_name": "2024年常州市生态环境状况公报",
+      "source_url": "https://sthjj.changzhou.gov.cn/class/HQPMBJFE",
+      "text": "根据《2024年常州市生态环境状况公报》，2024年，常州市水环境质量总体完成省定目标，地表水国考、省考断面优Ⅲ比例分别为85.0%和94.1%。全市持续推进太湖治理和国省考断面水质提升，重点湖库、河流及支浜水环境治理能力持续增强。"
+    },
+    {
+      "admin_division": "江苏省苏州市",
+      "province": "江苏省",
+      "city": "苏州市",
+      "county": "",
+      "admin_division_aliases": [
+        "江苏省苏州市",
+        "苏州市",
+        "苏州"
+      ],
+      "admin_level": "city",
+      "year": 2024,
+      "source_name": "2024年度苏州市生态环境状况公报",
+      "source_url": "https://sthjj.suzhou.gov.cn/szhbj/hjzl/xxgk_lists.shtml",
+      "text": "根据《2024年度苏州市生态环境状况公报》，2024年，苏州市国考、省考断面水质优Ⅲ比例分别达到93.3%和97.5%，省考以上优Ⅱ比例达到68.8%；国考30个断面中，年均水质达到或好于Ⅲ类标准的断面比例为93.3%，年均水质达到Ⅱ类标准的断面比例为63.3%，太湖水质达到国家良好湖泊要求并连续17年实现安全度夏。"
+    },
+    {
+      "admin_division": "江苏省南通市",
+      "province": "江苏省",
+      "city": "南通市",
+      "county": "",
+      "admin_division_aliases": [
+        "江苏省南通市",
+        "南通市",
+        "南通"
+      ],
+      "admin_level": "city",
+      "year": 2024,
+      "source_name": "2024年度南通市环境状况公报",
+      "source_url": "https://sthjj.nantong.gov.cn/ntshbj/hjzkgb/content/f51e8a4c-9535-439f-aafa-b37ffc804eff.html",
+      "text": "根据《2024年度南通市环境状况公报》，2024年，南通市水环境质量总体保持良好，市区濠河水质总体达到地表水Ⅲ类标准，各县（市、区）城区水质基本达到Ⅲ类标准。全市持续推进水环境治理和集中式饮用水水源地保护，地表水环境质量总体稳定。"
+    },
+    {
+      "admin_division": "江苏省连云港市",
+      "province": "江苏省",
+      "city": "连云港市",
+      "county": "",
+      "admin_division_aliases": [
+        "江苏省连云港市",
+        "连云港市",
+        "连云港"
+      ],
+      "admin_level": "city",
+      "year": 2024,
+      "source_name": "2024年度连云港市生态环境状况公报",
+      "source_url": "https://www.lyg.gov.cn/zglygzfmhwz/hjzl/content/aad0ada8-0316-4d2d-9085-02b655107862.html",
+      "text": "根据《2024年度连云港市生态环境状况公报》，2024年，连云港市地表水环境质量持续改善，国考断面优Ⅲ比例为90.9%，省考断面优Ⅲ比例为93.3%，近岸海域优良海水面积比例为96.8%，生态环境状况持续改善向好。"
+    },
+    {
+      "admin_division": "江苏省淮安市",
+      "province": "江苏省",
+      "city": "淮安市",
+      "county": "",
+      "admin_division_aliases": [
+        "江苏省淮安市",
+        "淮安市",
+        "淮安"
+      ],
+      "admin_level": "city",
+      "year": 2024,
+      "source_name": "2024年淮安市生态环境状况公报",
+      "source_url": "https://sthjj.huaian.gov.cn/col/13269_217411/index.html",
+      "text": "根据《2024年淮安市生态环境状况公报》，2024年，淮安市水环境质量总体保持稳定，纳入“十四五”国家地表水环境质量考核的11个国考断面中，年均水质达到或好于Ⅲ类标准的断面9个，优Ⅲ比例为81.8%；国省考断面水质总体完成年度管控要求。"
+    },
+    {
+      "admin_division": "江苏省盐城市",
+      "province": "江苏省",
+      "city": "盐城市",
+      "county": "",
+      "admin_division_aliases": [
+        "江苏省盐城市",
+        "盐城市",
+        "盐城"
+      ],
+      "admin_level": "city",
+      "year": 2024,
+      "source_name": "2024年盐城市环境质量状况公报",
+      "source_url": "https://www.yancheng.gov.cn/art/2025/5/21/art_23126_4324162.html",
+      "text": "根据《2024年盐城市环境质量状况公报》，2024年，盐城市地表水环境质量总体良好，继续位于全省第一方阵。全市17个国考断面水质均达到或好于Ⅲ类水质，比例为100%，无劣Ⅴ类水质断面；51个省考以上断面达到或好于Ⅲ类水质，集中式饮用水水源地水质保持稳定。"
+    },
+    {
+      "admin_division": "江苏省镇江市",
+      "province": "江苏省",
+      "city": "镇江市",
+      "county": "",
+      "admin_division_aliases": [
+        "江苏省镇江市",
+        "镇江市",
+        "镇江"
+      ],
+      "admin_level": "city",
+      "year": 2024,
+      "source_name": "2024年度镇江市生态环境状况公报",
+      "source_url": "https://www.jiangsu.gov.cn/art/2025/6/5/art_84324_11579640.html",
+      "text": "根据《2024年度镇江市生态环境状况公报》，2024年，镇江市水环境质量继续保持较好水平，列入《江苏省水污染防治工作计划》地表水环境质量考核的10个国考断面中，优Ⅱ类断面比例为60%，水环境质量继续保持全省前列。"
+    },
+    {
+      "admin_division": "江苏省泰州市",
+      "province": "江苏省",
+      "city": "泰州市",
+      "county": "",
+      "admin_division_aliases": [
+        "江苏省泰州市",
+        "泰州市",
+        "泰州"
+      ],
+      "admin_level": "city",
+      "year": 2024,
+      "source_name": "2024年泰州市环境状况公报",
+      "source_url": "https://hbj.taizhou.gov.cn/hjzl/hjgb/art/2025/art_d3aaa0cd890a49d580af9c550cc01717.html",
+      "text": "根据《2024年泰州市环境状况公报》，2024年，泰州市水环境质量持续向好，重点流域水质改善明显。全市地表水国考、省考断面优Ⅲ比例均为100%，连续三年保持“双百”水平；2个城市集中式饮用水源地取水达标率为100%，全市12个国考断面和39个省考断面均无劣Ⅴ类水质断面。"
+    },
+    {
+      "admin_division": "江苏省南通市启东市",
+      "province": "江苏省",
+      "city": "南通市",
+      "county": "启东市",
+      "admin_division_aliases": [
+        "江苏省南通市启东市",
+        "南通市启东市",
+        "启东市",
+        "启东"
+      ],
+      "admin_level": "county_city",
+      "year": 2024,
+      "source_name": "2024年启东市生态环境状况公报",
+      "source_url": "https://www.qidong.gov.cn/",
+      "text": "根据《2024年启东市生态环境状况公报》，2024年，启东市水环境质量总体保持稳定，市考以上断面优Ⅲ类比例为100%，无劣Ⅴ类断面；头兴港备用水源地各单月及年均水质均保持Ⅲ类水质；6条主要入江入海河流考核断面年均水质均达到或优于Ⅲ类标准，水质总体保持良好。"
+    },
+    {
+      "admin_division": "江苏省南通市海门区",
+      "province": "江苏省",
+      "city": "南通市",
+      "county": "海门区",
+      "admin_division_aliases": [
+        "江苏省南通市海门区",
+        "南通市海门区",
+        "海门区",
+        "海门"
+      ],
+      "admin_level": "district",
+      "year": 2024,
+      "source_name": "2024年南通市海门区环境质量状况",
+      "source_url": "https://www.haimen.gov.cn/hmsrmzf/hjzl/content/c38d9c99-e967-4d49-9074-61e08c61e68d.html",
+      "text": "根据《2024年南通市海门区环境质量状况》，2024年，海门区地表水8个省考断面、6个市考断面和40个区考断面水质年均值全部达到《地表水环境质量标准》Ⅲ类标准，优Ⅲ类比例达100%；长江海门段各监测断面水质全部达到Ⅲ类标准，集中式饮用水水源地水质达标率为100%。"
+    },
+    {
+      "admin_division": "江苏省盐城市盐都区",
+      "province": "江苏省",
+      "city": "盐城市",
+      "county": "盐都区",
+      "admin_division_aliases": [
+        "江苏省盐城市盐都区",
+        "盐城市盐都区",
+        "盐都区",
+        "盐都"
+      ],
+      "admin_level": "district",
+      "year": 2024,
+      "source_name": "2024年盐城市盐都区环境质量状况公报",
+      "source_url": "https://www.yandu.gov.cn/art/2025/7/1/art_33307_4335112.html",
+      "text": "根据《2024年盐城市盐都区环境质量状况公报》，2024年，盐都区地表水环境质量稳中趋好，全区2个国考断面和4个省考断面水质均达到或好于Ⅲ类水质，比例为100%，主要污染指标高锰酸盐指数、氨氮、总磷浓度呈下降趋势。"
+    },
+    {
+      "admin_division": "江苏省苏州市常熟市",
+      "province": "江苏省",
+      "city": "苏州市",
+      "county": "常熟市",
+      "admin_division_aliases": [
+        "江苏省苏州市常熟市",
+        "苏州市常熟市",
+        "常熟市",
+        "常熟"
+      ],
+      "admin_level": "county_city",
+      "year": 2024,
+      "source_name": "2024年度常熟市生态环境状况公报",
+      "source_url": "https://www.changshu.gov.cn/zgcs/sthjzkgb/202506/7ebca635ec634acb977aa64fb88a7503/files/d7d1b74d68a3457faa73b74e7d97aa65.pdf",
+      "text": "根据《2024年度常熟市生态环境状况公报》，2024年，常熟市地表水水质状况为优，达到或优于Ⅲ类水质断面的比例为98.0%，较上年上升4.0个百分点；主要河流水质总体保持优良。"
+    },
+    {
+      "admin_division": "江苏省苏州市昆山市",
+      "province": "江苏省",
+      "city": "苏州市",
+      "county": "昆山市",
+      "admin_division_aliases": [
+        "江苏省苏州市昆山市",
+        "苏州市昆山市",
+        "昆山市",
+        "昆山"
+      ],
+      "admin_level": "county_city",
+      "year": 2024,
+      "source_name": "2024年度昆山市环境状况公报",
+      "source_url": "https://data.ks.gov.cn/kss/jsxm/202505/c77867d460e5433dab297f3d0b42a9d7.shtml",
+      "text": "根据《2024年度昆山市环境状况公报》，2024年，昆山市集中式饮用水水源地水质均达到《地表水环境质量标准》（GB3838-2002）Ⅲ类水标准，达标率为100%；全市7条主要河流水质状况在优至良好之间，娄江河、庙泾河、张家港、七浦塘、杨林塘、急水港水质状况为优，吴淞江为良好。"
+    },
+    {
+      "admin_division": "江苏省泰州市姜堰区",
+      "province": "江苏省",
+      "city": "泰州市",
+      "county": "姜堰区",
+      "admin_division_aliases": [
+        "江苏省泰州市姜堰区",
+        "泰州市姜堰区",
+        "姜堰区",
+        "姜堰"
+      ],
+      "admin_level": "district",
+      "year": 2024,
+      "source_name": "2024年泰州市姜堰区生态环境质量公报",
+      "source_url": "https://www.jiangyan.gov.cn/cms_files/filemanager/1574877257/attach/20256/3578fdc0abeb46ef844cd603be88dfbb.pdf",
+      "text": "根据《2024年泰州市姜堰区生态环境质量公报》，2024年，姜堰区国控断面泰东河泰东大桥断面和新通扬运河朱楼桥断面水质均达到Ⅲ类水质标准，地表水环境质量总体保持稳定。"
+    }
+  ]
+}

@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import traceback
 import zipfile
 from datetime import datetime
@@ -15,6 +16,13 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from noise_table_preprocessor import export_noise_table_debug
+from section_docx_combiner import (
+    COMBINED_SECTION_FILENAME,
+    NOISE_SECTION_FILENAME,
+    PROJECT_AREA_OVERVIEW_FILENAME,
+    SURFACE_WATER_SECTION_FILENAME,
+    build_combined_section_docx,
+)
 from word_processor import load_docx_chunks
 
 
@@ -62,6 +70,10 @@ RESULT_GROUP_DEFINITIONS = {
             "monitoring_records.json",
             "standard_config.json",
             "debug_tables/detected_factors.json",
+            "debug_tables/project_area_overview_sources.json",
+            "debug_tables/project_area_overview_llm_input.json",
+            "debug_tables/project_area_overview_llm_output.json",
+            "debug_tables/project_area_overview_status.json",
             "debug_tables/noise_monitor_points_table.json",
             "debug_tables/surface_water_monitor_points_table.json",
             "debug_tables/surface_water_monitor_results_table.json",
@@ -80,8 +92,7 @@ RESULT_GROUP_DEFINITIONS = {
     "text_output": {
         "title": "文本输出",
         "files": [
-            "surface_water_section.docx",
-            "noise_section.docx",
+            COMBINED_SECTION_FILENAME,
             "eia_outputs.zip",
         ],
     },
@@ -142,6 +153,8 @@ async def create_job(
             "current_step": "等待执行",
             "error": None,
             "result_groups": {},
+            "enable_llm_text_polish": enable_llm_text_polish,
+            "llm_text_polish": build_llm_text_polish_status(output_dir, enable_llm_text_polish),
         },
     )
     background_tasks.add_task(
@@ -159,6 +172,10 @@ def get_job(job_id: str) -> JSONResponse:
     job_dir = resolve_job_dir(job_id)
     status = read_status(job_dir)
     status["result_groups"] = build_result_groups(job_id)
+    status["llm_text_polish"] = build_llm_text_polish_status(
+        job_dir / "output",
+        bool(status.get("enable_llm_text_polish")),
+    )
     return JSONResponse(status)
 
 
@@ -201,6 +218,13 @@ def run_job(
 
     try:
         update_status(job_dir, {"status": "running", "current_step": "初始化任务", "error": None})
+        update_status(
+            job_dir,
+            {
+                "enable_llm_text_polish": enable_llm_text_polish,
+                "llm_text_polish": build_llm_text_polish_status(output_dir, enable_llm_text_polish),
+            },
+        )
         append_log(log_path, f"job_id: {job_id}")
         append_log(log_path, f"input_dir: {input_dir}")
         append_log(log_path, f"output_dir: {output_dir}")
@@ -219,12 +243,29 @@ def run_job(
 
         if run_noise:
             update_status(job_dir, {"current_step": "声环境：预处理噪声表格"})
+            noise_prepare_started = time.perf_counter()
             prepare_noise_debug_tables(input_dir, output_dir, log_path)
+            append_log(log_path, f"step duration: 声环境：预处理噪声表格 {time.perf_counter() - noise_prepare_started:.2f}s")
             update_status(job_dir, {"current_step": "声环境：生成 Word 章节"})
             run_script("noise_section_generator.py", env, log_path)
+            update_status(
+                job_dir,
+                {"llm_text_polish": build_llm_text_polish_status(output_dir, enable_llm_text_polish)},
+            )
+
+        update_status(job_dir, {"current_step": "生成项目区域环境概况"})
+        run_optional_script("project_area_overview_generator.py", env, log_path)
+
+        update_status(job_dir, {"current_step": "生成合并版 Word"})
+        combine_started = time.perf_counter()
+        combined_path = build_combined_section_docx(output_dir)
+        append_log(log_path, f"combined section generated: {combined_path.relative_to(output_dir)}")
+        append_log(log_path, f"step duration: 生成合并版 Word {time.perf_counter() - combine_started:.2f}s")
 
         update_status(job_dir, {"current_step": "打包输出文件"})
+        zip_started = time.perf_counter()
         create_output_zip(output_dir)
+        append_log(log_path, f"step duration: 打包输出文件 {time.perf_counter() - zip_started:.2f}s")
         update_status(
             job_dir,
             {
@@ -232,6 +273,7 @@ def run_job(
                 "current_step": "完成",
                 "error": None,
                 "result_groups": build_result_groups(job_id),
+                "llm_text_polish": build_llm_text_polish_status(output_dir, enable_llm_text_polish),
             },
         )
         append_log(log_path, "job finished successfully")
@@ -245,12 +287,14 @@ def run_job(
                 "current_step": "失败",
                 "error": str(exc),
                 "result_groups": build_result_groups(job_id),
+                "llm_text_polish": build_llm_text_polish_status(output_dir, enable_llm_text_polish),
             },
         )
 
 
 def run_script(script_name: str, env: Dict[str, str], log_path: Path) -> None:
     append_log(log_path, f"> python {script_name}")
+    started = time.perf_counter()
     completed = subprocess.run(
         [sys.executable, script_name],
         cwd=BASE_DIR,
@@ -264,8 +308,19 @@ def run_script(script_name: str, env: Dict[str, str], log_path: Path) -> None:
         append_log(log_path, completed.stdout.rstrip())
     if completed.stderr:
         append_log(log_path, completed.stderr.rstrip())
+    append_log(log_path, f"step duration: {script_name} {time.perf_counter() - started:.2f}s")
     if completed.returncode != 0:
         raise RuntimeError(f"{script_name} 执行失败，退出码 {completed.returncode}")
+
+
+def run_optional_script(script_name: str, env: Dict[str, str], log_path: Path) -> bool:
+    try:
+        run_script(script_name, env, log_path)
+        return True
+    except Exception as exc:
+        append_log(log_path, f"optional step skipped: {script_name}: {exc}")
+        append_log(log_path, traceback.format_exc())
+        return False
 
 
 def prepare_noise_debug_tables(input_dir: Path, output_dir: Path, log_path: Path) -> None:
@@ -290,10 +345,20 @@ def create_output_zip(output_dir: Path) -> None:
     zip_path = output_dir / "eia_outputs.zip"
     if zip_path.exists():
         zip_path.unlink()
+    excluded_word_sections = {
+        NOISE_SECTION_FILENAME,
+        PROJECT_AREA_OVERVIEW_FILENAME,
+        SURFACE_WATER_SECTION_FILENAME,
+    }
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in output_dir.rglob("*"):
-            if path.is_file() and path != zip_path:
-                archive.write(path, path.relative_to(output_dir))
+            if not path.is_file() or path == zip_path:
+                continue
+            if path.name in excluded_word_sections:
+                continue
+            if path.suffix.lower() == ".docx" and path.name != COMBINED_SECTION_FILENAME:
+                continue
+            archive.write(path, path.relative_to(output_dir))
 
 
 def build_result_groups(job_id: str) -> Dict[str, Dict[str, Any]]:
@@ -312,6 +377,7 @@ def build_result_groups(job_id: str) -> Dict[str, Dict[str, Any]]:
 
 def build_preview_payload(output_dir: Path) -> Dict[str, Any]:
     return {
+        "llm_text_polish": build_llm_text_polish_status(output_dir, None),
         "monitoring_extraction": {
             "surface_water_results": read_table_preview(
                 output_dir,
@@ -355,6 +421,88 @@ def build_preview_payload(output_dir: Path) -> Dict[str, Any]:
                 output_dir / "debug_tables/noise_compliance_summary.json"
             ),
         },
+    }
+
+
+def build_llm_text_polish_status(output_dir: Path, enabled: Any = None) -> Dict[str, Any]:
+    validations = {
+        "地表水": read_optional_json(output_dir / "debug_tables/surface_water_llm_text_validation.json"),
+        "声环境": read_optional_json(output_dir / "debug_tables/noise_llm_text_validation.json"),
+    }
+    available = {
+        name: validation
+        for name, validation in validations.items()
+        if isinstance(validation, dict) and validation
+    }
+    if len(available) > 1:
+        warnings: List[str] = []
+        failed: List[str] = []
+        succeeded: List[str] = []
+        used_any = False
+        for name, validation in available.items():
+            used_llm = validation.get("used_llm") is True
+            valid = validation.get("valid") is True
+            used_any = used_any or used_llm
+            if used_llm and valid:
+                succeeded.append(name)
+            elif validation.get("valid") is not True:
+                failed.append(name)
+            for item in validation.get("warnings", []):
+                warnings.append(f"{name}: {item}")
+        if failed:
+            return {
+                "enabled": enabled if enabled is not None else used_any,
+                "state": "failed",
+                "label": "、".join(failed) + "调用失败",
+                "used_llm": used_any,
+                "valid": False,
+                "warnings": warnings,
+            }
+        if succeeded:
+            return {
+                "enabled": enabled if enabled is not None else used_any,
+                "state": "success",
+                "label": "、".join(succeeded) + "调用成功",
+                "used_llm": used_any,
+                "valid": True,
+                "warnings": warnings,
+            }
+
+    validation = available.get("地表水") or available.get("声环境") or {}
+    if not isinstance(validation, dict) or not validation:
+        if enabled is False:
+            return {
+                "enabled": False,
+                "state": "not_enabled",
+                "label": "未启用",
+                "warnings": [],
+            }
+        return {
+            "enabled": bool(enabled),
+            "state": "pending" if enabled else "unknown",
+            "label": "等待结果" if enabled else "暂无结果",
+            "warnings": [],
+        }
+
+    used_llm = validation.get("used_llm") is True
+    valid = validation.get("valid") is True
+    warnings = validation.get("warnings") if isinstance(validation.get("warnings"), list) else []
+    if not used_llm:
+        state = "not_enabled" if validation.get("valid") else "failed"
+        label = "未启用" if state == "not_enabled" else "未调用"
+    elif valid:
+        state = "success"
+        label = "调用成功"
+    else:
+        state = "failed"
+        label = "调用失败"
+    return {
+        "enabled": enabled if enabled is not None else used_llm,
+        "state": state,
+        "label": label,
+        "used_llm": used_llm,
+        "valid": valid,
+        "warnings": [str(item) for item in warnings],
     }
 
 

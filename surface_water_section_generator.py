@@ -1,11 +1,19 @@
 import json
 import os
+import re
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import OrderedDict, defaultdict
+from datetime import datetime
+from html import unescape
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from dotenv import load_dotenv
 from docx import Document
 from docx.enum.section import WD_ORIENT
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
@@ -14,10 +22,30 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
+from llm_extractor import (
+    DEFAULT_ENDPOINT,
+    LLM_MAX_RETRIES,
+    LLM_RETRY_DELAY_SECONDS,
+    LLM_TIMEOUT_SECONDS,
+    SSL_CONTEXT,
+)
 
+load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent
+INPUT_DIR = Path(os.getenv("EIA_INPUT_DIR", "input"))
 OUTPUT_DIR = Path(os.getenv("EIA_OUTPUT_DIR", "output"))
 DEBUG_DIR = OUTPUT_DIR / "debug_tables"
 SECTION_PATH = OUTPUT_DIR / "surface_water_section.docx"
+ENABLE_LLM_TEXT_POLISH = os.getenv("ENABLE_LLM_TEXT_POLISH", "false").lower() == "true"
+TEXT_POLISH_GUIDANCE_PATH = Path(
+    os.getenv("EIA_SURFACE_WATER_TEXT_POLISH_GUIDANCE", BASE_DIR / "config" / "surface_water_text_polish_guidance.json")
+)
+LOCAL_STATUS_CACHE_PATH = Path(
+    os.getenv("EIA_SURFACE_WATER_LOCAL_STATUS_CACHE", BASE_DIR / "config" / "surface_water_local_status_cache.json")
+)
+LOCAL_STATUS_WEB_SEARCH = os.getenv("EIA_SURFACE_WATER_WEB_SEARCH", "true").lower() != "false"
+LOCAL_STATUS_WEB_TIMEOUT_SECONDS = int(os.getenv("EIA_SURFACE_WATER_WEB_TIMEOUT_SECONDS", "12"))
 
 FACTOR_ALIASES = {
     "pH": "pH值",
@@ -36,6 +64,15 @@ FACTOR_ALIASES = {
 }
 
 NOT_APPLICABLE_FACTORS = {"水温", "悬浮物"}
+
+ADMIN_LEVEL_WEIGHTS = {
+    "county": 300,
+    "county_city": 300,
+    "district": 300,
+    "city": 200,
+    "province": 100,
+    "unknown": 0,
+}
 
 
 def main() -> None:
@@ -73,8 +110,22 @@ def main() -> None:
     write_json(DEBUG_DIR / "surface_water_monitor_results_table.json", table2)
     write_json(DEBUG_DIR / "surface_water_compliance_table.json", table3)
 
+    project_meta = read_project_meta()
+    local_status = build_local_water_status(project_meta.get("admin_division", ""))
     conclusion = build_conclusion(surface_results)
-    doc = build_docx(table1, table2, table3, factor_list, evaluated_factors, conclusion)
+    rule_texts = build_rule_texts(table1, table2, factor_list, surface_results, conclusion)
+    rule_texts["local_status_text"] = local_status.get("text", "")
+    write_json(DEBUG_DIR / "surface_water_local_status.json", local_status)
+    texts = polish_surface_water_text_with_llm(
+        rule_texts,
+        table1,
+        table2,
+        table3,
+        factor_list,
+        evaluated_factors,
+        surface_results,
+    )
+    doc = build_docx(table1, table2, table3, factor_list, evaluated_factors, texts)
     doc.save(SECTION_PATH)
     print(f"generated: {SECTION_PATH}")
     print(f"detected_factors: {len(factor_list)}")
@@ -101,6 +152,17 @@ def ensure_inputs() -> None:
 
 def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_project_meta() -> Dict[str, Any]:
+    path = INPUT_DIR / "project_meta.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def write_json(path: Path, payload: Any) -> None:
@@ -271,27 +333,615 @@ def build_conclusion(results: List[Dict[str, Any]]) -> str:
         result for result in results
         if result.get("is_compliant") is False
     ]
+    compliant_text = build_compliant_factor_summary(results)
     if not exceed_items:
-        rivers = unique_ordered(result.get("river_name") for result in results if result.get("river_name"))
-        factors = unique_ordered(
-            normalize_factor(result.get("factor"))
-            for result in results
-            if result.get("is_compliant") is True
-        )
-        river_text = "、".join(rivers) if rivers else "各监测断面"
-        factor_text = "、".join(factors) if factors else "各评价因子"
         return (
-            f"根据监测及评价结果，{river_text}的{factor_text}等评价因子"
-            "均满足《地表水环境质量标准》（GB3838-2002）相应水质类别标准要求。"
+            f"根据监测及评价结果，项目地表水各监测断面水质总体满足相应水质类别标准要求。"
+            f"各监测点位的{compliant_text}均满足《地表水环境质量标准》（GB3838-2002）"
+            "相应水质类别标准要求。"
         )
 
+    exceed_text = build_exceed_summary(exceed_items)
+    reason_text = build_surface_water_exceed_reason(exceed_items)
+    return (
+        f"根据现状监测及评价结果，项目地表水监测断面水质总体以达标为主，局部断面存在个别因子超标。"
+        f"除超标因子外，各监测点位的{compliant_text}"
+        "均满足《地表水环境质量标准》（GB3838-2002）相应水质类别标准要求。"
+        f"超标情况为：{exceed_text}。{reason_text}"
+    )
+
+
+def build_compliant_factor_summary(results: List[Dict[str, Any]]) -> str:
+    compliant_factors = unique_ordered(
+        normalize_factor(result.get("factor"))
+        for result in results
+        if result.get("is_compliant") is True
+    )
+    if not compliant_factors:
+        return "相关评价因子"
+    return "、".join(compliant_factors) + "等评价因子"
+
+
+def build_exceed_summary(exceed_items: List[Dict[str, Any]]) -> str:
     details = []
     for item in exceed_items:
         details.append(
             f"{item.get('river_name') or '-'}（{item.get('point_code') or '-'}）"
-            f"{item.get('sample_date') or '-'} {item.get('factor') or '-'}"
+            f"{item.get('sample_date') or '-'} {normalize_factor(item.get('factor')) or '-'}"
         )
-    return "根据现状监测及评价结果，存在超标情况，超标断面、因子及监测日期为：" + "；".join(details) + "。"
+    return "；".join(details)
+
+
+def build_surface_water_exceed_reason(exceed_items: List[Dict[str, Any]]) -> str:
+    factors = unique_ordered(normalize_factor(item.get("factor")) for item in exceed_items)
+    if not factors:
+        return ""
+    factor_text = "、".join(factors)
+    return (
+        f"超标原因可能与项目所在区域现状水体受上游来水、沿线生活及农业面源等综合影响有关，"
+        f"其中{factor_text}指标在局部断面出现波动。"
+    )
+
+
+def build_compliant_summary(results: List[Dict[str, Any]]) -> str:
+    grouped: "OrderedDict[str, List[str]]" = OrderedDict()
+    for result in results:
+        if result.get("is_compliant") is not True:
+            continue
+        key = f"{result.get('river_name') or '-'}（{result.get('point_code') or '-'}）{result.get('sample_date') or '-'}"
+        factor = normalize_factor(result.get("factor"))
+        if not factor:
+            continue
+        grouped.setdefault(key, [])
+        if factor not in grouped[key]:
+            grouped[key].append(factor)
+    if not grouped:
+        return "各监测断面相关评价因子"
+    return "；".join(f"{key}的{'、'.join(factors)}" for key, factors in grouped.items()) + "等评价因子"
+
+
+def build_rule_texts(
+    table1: Dict[str, Any],
+    table2: Dict[str, Any],
+    factor_list: List[str],
+    results: List[Dict[str, Any]],
+    conclusion: str,
+) -> Dict[str, str]:
+    return {
+        "monitor_points_text": (
+            f"根据项目所在区域的水文特征、河流水体规模，共计在评价范围设置了"
+            f"{len(table1['rows'])}个监测断面进行水质监测。监测断面概况详见表4.2-4。"
+        ),
+        "monitoring_time_method_text": build_monitoring_description(table1, factor_list),
+        "monitoring_result_text": build_surface_water_result_intro(table2),
+        "evaluation_result_intro": "地表水监测点位环境现状评价结果见表4.2-6。",
+        "conclusion": conclusion,
+    }
+
+
+def build_surface_water_result_intro(table2: Dict[str, Any]) -> str:
+    dates = unique_ordered(row.get("监测时间") for row in table2.get("rows", []) if row.get("监测时间"))
+    date_text = "、".join(dates)
+    if date_text:
+        return f"本项目地表水于{date_text}开展现状监测，监测结果详见表4.2-5。"
+    return "本项目地表水监测结果详见表4.2-5。"
+
+
+def build_local_water_status(admin_division: str) -> Dict[str, Any]:
+    admin_text = str(admin_division or "").strip()
+    started = time.time()
+    cache = read_local_status_cache()
+    matches: List[Dict[str, Any]] = []
+    for item in cache.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        match = build_cache_match(admin_text, item)
+        if match.get("matched"):
+            matches.append(match)
+
+    if matches:
+        selected = sorted(
+            matches,
+            key=lambda match: cache_match_sort_key(match),
+            reverse=True,
+        )[0]
+        selected_item = selected["item"]
+        text = str(selected_item.get("text") or "").strip()
+        match_candidates = [
+            {
+                "source_name": match["item"].get("source_name"),
+                "year": match["item"].get("year"),
+                "admin_level": match["item"].get("admin_level"),
+                "matched_alias": match.get("matched_alias"),
+                "matched_candidate": match.get("matched_candidate"),
+                "score": match.get("score"),
+                "score_detail": match.get("score_detail"),
+            }
+            for match in sorted(matches, key=lambda match: cache_match_sort_key(match), reverse=True)[:8]
+        ]
+        return {
+            "admin_division": admin_text,
+            "admin_candidates": extract_admin_search_candidates(admin_text),
+            "status": "cache_hit",
+            "cache_hit_used_directly": True,
+            "year": selected_item.get("year"),
+            "match_level": selected_item.get("admin_level"),
+            "matched_alias": selected.get("matched_alias"),
+            "matched_candidate": selected.get("matched_candidate"),
+            "match_score": selected.get("score"),
+            "score_detail": selected.get("score_detail"),
+            "source_name": selected_item.get("source_name"),
+            "source_url": selected_item.get("source_url"),
+            "search_query": build_local_status_search_query(admin_text),
+            "web_search": {
+                "status": "skipped",
+                "web_search_skipped_reason": "cache_hit_used_directly",
+                "text": "",
+            },
+            "cache_candidates": match_candidates,
+            "elapsed_ms": int((time.time() - started) * 1000),
+            "text": text,
+        }
+
+    web_started = time.time()
+    web_result = search_local_water_status_web(admin_text)
+    web_result["elapsed_ms"] = int((time.time() - web_started) * 1000)
+    if web_result.get("text"):
+        web_result["cache_hit_used_directly"] = False
+        web_result["elapsed_ms"] = int((time.time() - started) * 1000)
+        return web_result
+
+    payload = {
+        "admin_division": admin_text,
+        "admin_candidates": extract_admin_search_candidates(admin_text),
+        "status": "missing_cache",
+        "cache_hit_used_directly": False,
+        "search_query": build_local_status_search_query(admin_text),
+        "web_search": web_result,
+        "elapsed_ms": int((time.time() - started) * 1000),
+        "text": "",
+        "warning": "联网检索和本地缓存均未得到可用公报文本，未生成区域地表水环境质量现状段落。",
+    }
+    return payload
+
+
+def search_local_water_status_web(admin_division: str) -> Dict[str, Any]:
+    admin_text = str(admin_division or "").strip()
+    if not LOCAL_STATUS_WEB_SEARCH:
+        return {
+            "admin_division": admin_text,
+            "status": "web_disabled",
+            "search_query": build_local_status_search_query(admin_text),
+            "text": "",
+        }
+
+    candidates = extract_admin_search_candidates(admin_text)
+    current_year = datetime.now().year
+    years = [current_year - 1, current_year - 2, current_year]
+    searched: List[Dict[str, Any]] = []
+    usable: List[Dict[str, Any]] = []
+
+    for candidate in candidates:
+        for year in years:
+            query = f"{candidate} {year}年 生态环境状况公报 地表水 水质"
+            try:
+                results = search_bing(query)
+            except Exception as exc:
+                searched.append({"query": query, "error": str(exc)})
+                continue
+            searched.append({"query": query, "result_count": len(results)})
+            for result in results[:5]:
+                page_payload = build_local_status_from_search_result(
+                    admin_text,
+                    candidate,
+                    year,
+                    result,
+                )
+                if page_payload.get("text"):
+                    usable.append(page_payload)
+
+    if not usable:
+        return {
+            "admin_division": admin_text,
+            "status": "web_no_usable_result",
+            "search_query": build_local_status_search_query(admin_text),
+            "searched": searched,
+            "text": "",
+        }
+
+    selected = sorted(
+        usable,
+        key=lambda item: (
+            int(item.get("match_score") or 0),
+            int(item.get("year") or 0),
+            int(item.get("source_score") or 0),
+        ),
+        reverse=True,
+    )[0]
+    selected["status"] = "web_hit"
+    selected["searched"] = searched
+    return selected
+
+
+def search_bing(query: str) -> List[Dict[str, str]]:
+    url = "https://www.bing.com/search?q=" + urllib.parse.quote(query)
+    html_text = fetch_url_text(url)
+    results: List[Dict[str, str]] = []
+    for match in re.finditer(
+        r'<li class="b_algo".*?<h2.*?<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?(?:<p>(.*?)</p>)?',
+        html_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        result_url = normalize_search_result_url(unescape(match.group(1)))
+        title = clean_html_text(match.group(2))
+        snippet = clean_html_text(match.group(3) or "")
+        if result_url and title:
+            results.append({"title": title, "url": result_url, "snippet": snippet})
+    return results
+
+
+def normalize_search_result_url(url: str) -> str:
+    text = unescape(url or "")
+    if "bing.com/ck/" not in text:
+        return text
+    parsed = urllib.parse.urlparse(text)
+    params = urllib.parse.parse_qs(parsed.query)
+    encoded = (params.get("u") or [""])[0]
+    if encoded.startswith("a1"):
+        encoded = encoded[2:]
+    try:
+        import base64
+
+        padding = "=" * (-len(encoded) % 4)
+        decoded = base64.urlsafe_b64decode((encoded + padding).encode("ascii")).decode("utf-8", errors="ignore")
+        if decoded.startswith("http"):
+            return decoded
+    except Exception:
+        pass
+    return text
+
+
+def build_local_status_from_search_result(
+    admin_division: str,
+    candidate: str,
+    query_year: int,
+    result: Dict[str, str],
+) -> Dict[str, Any]:
+    title = result.get("title", "")
+    url = result.get("url", "")
+    snippet = result.get("snippet", "")
+    page_text = ""
+    fetch_error = ""
+    try:
+        page_text = fetch_url_text(url)
+    except Exception as exc:
+        fetch_error = str(exc)
+
+    clean_text = html_to_text(page_text) if page_text else snippet
+    year = extract_year(title, snippet, clean_text) or query_year
+    extracted = extract_water_status_sentences(clean_text or snippet)
+    if not extracted:
+        return {
+            "admin_division": admin_division,
+            "candidate": candidate,
+            "year": year,
+            "source_name": clean_source_name(title, candidate, year),
+            "source_url": url,
+            "fetch_error": fetch_error,
+            "text": "",
+        }
+
+    source_name = clean_source_name(title, candidate, year)
+    text = format_local_status_text(source_name, year, extracted)
+    return {
+        "admin_division": admin_division,
+        "candidate": candidate,
+        "year": year,
+        "match_score": admin_candidate_score(admin_division, candidate),
+        "source_score": source_url_score(url),
+        "source_name": source_name,
+        "source_url": url,
+        "source_title": title,
+        "source_snippet": snippet,
+        "fetch_error": fetch_error,
+        "text": text,
+    }
+
+
+def fetch_url_text(url: str) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=LOCAL_STATUS_WEB_TIMEOUT_SECONDS, context=SSL_CONTEXT) as response:
+        raw = response.read(2_000_000)
+    return raw.decode("utf-8", errors="ignore")
+
+
+def clean_html_text(value: str) -> str:
+    text = re.sub(r"<.*?>", "", value or "", flags=re.DOTALL)
+    return unescape(re.sub(r"\s+", " ", text)).strip()
+
+
+def html_to_text(html_text: str) -> str:
+    text = re.sub(r"(?is)<script.*?</script>|<style.*?</style>", " ", html_text or "")
+    text = re.sub(r"(?is)<br\s*/?>|</p>|</div>|</li>|</tr>|</h\d>", "\n", text)
+    text = re.sub(r"(?is)<.*?>", " ", text)
+    text = unescape(text)
+    return re.sub(r"[ \t\r\f\v]+", " ", text)
+
+
+def extract_water_status_sentences(text: str) -> List[str]:
+    normalized = re.sub(r"\s+", "", text or "")
+    parts = re.split(r"(?<=[。；;])", normalized)
+    keywords = ("地表水", "水环境", "断面", "优Ⅲ", "优III", "饮用水", "水源", "水质", "国考", "省考")
+    selected: List[str] = []
+    for part in parts:
+        if len(part) < 12 or len(part) > 180:
+            continue
+        if not any(keyword in part for keyword in keywords):
+            continue
+        if not re.search(r"\d|Ⅲ|III|Ⅱ|II|Ⅴ|V|优|良好|达标", part):
+            continue
+        if part not in selected:
+            selected.append(part)
+        if len(selected) >= 5:
+            break
+    return selected
+
+
+def extract_year(*texts: str) -> Optional[int]:
+    for text in texts:
+        for match in re.finditer(r"(20\d{2})年?", text or ""):
+            year = int(match.group(1))
+            if 2000 <= year <= datetime.now().year:
+                return year
+    return None
+
+
+def clean_source_name(title: str, candidate: str, year: int) -> str:
+    title_text = re.split(r"[-_|—]", title or "")[0].strip()
+    if "公报" in title_text:
+        return title_text
+    return f"{year}年{candidate}生态环境状况公报"
+
+
+def format_local_status_text(source_name: str, year: int, sentences: List[str]) -> str:
+    body = "".join(sentences).strip()
+    body = re.sub(rf"^根据《?{re.escape(source_name)}》?[，,]?", "", body)
+    body = re.sub(rf"^{year}年[，,]?", "", body)
+    return f"根据《{source_name}》，{year}年，{body}"
+
+
+def admin_candidate_score(admin_division: str, candidate: str) -> int:
+    candidates = extract_admin_search_candidates(admin_division)
+    try:
+        parsed = parse_admin_division(admin_division)
+        level_weight = ADMIN_LEVEL_WEIGHTS.get(parsed.get("candidate_levels", {}).get(candidate, ""), 0)
+        return 100 - candidates.index(candidate) * 10 + level_weight + len(candidate)
+    except ValueError:
+        return len(candidate)
+
+
+def source_url_score(url: str) -> int:
+    host = urllib.parse.urlparse(url or "").netloc.lower()
+    if host.endswith(".gov.cn") or ".gov.cn" in host:
+        return 30
+    if host.endswith(".cn"):
+        return 10
+    return 0
+
+
+def build_cache_match(admin_division: str, item: Dict[str, Any]) -> Dict[str, Any]:
+    admin_text = str(admin_division or "").strip()
+    aliases = local_status_item_aliases(item)
+    candidates = extract_admin_search_candidates(admin_text)
+    candidate_levels = parse_admin_division(admin_text).get("candidate_levels", {})
+    best: Optional[Dict[str, Any]] = None
+
+    for alias in aliases:
+        for index, candidate in enumerate(candidates):
+            relation = admin_alias_relation(admin_text, candidate, alias)
+            if not relation:
+                continue
+            item_level = normalize_admin_level(item.get("admin_level"))
+            candidate_level = candidate_levels.get(candidate, infer_admin_level(candidate))
+            score_detail = {
+                "relation": relation,
+                "candidate_order": index,
+                "item_level": item_level,
+                "candidate_level": candidate_level,
+                "item_level_weight": ADMIN_LEVEL_WEIGHTS.get(item_level, 0),
+                "candidate_level_weight": ADMIN_LEVEL_WEIGHTS.get(candidate_level, 0),
+                "year": int(item.get("year") or 0),
+                "alias_length": len(alias),
+            }
+            score = (
+                relation_score(relation)
+                + ADMIN_LEVEL_WEIGHTS.get(item_level, 0)
+                + ADMIN_LEVEL_WEIGHTS.get(candidate_level, 0) // 4
+                + max(0, 80 - index * 10)
+                + len(alias)
+            )
+            current = {
+                "matched": True,
+                "item": item,
+                "matched_alias": alias,
+                "matched_candidate": candidate,
+                "score": score,
+                "score_detail": score_detail,
+            }
+            if best is None or cache_match_sort_key(current) > cache_match_sort_key(best):
+                best = current
+
+    if best:
+        return best
+    return {"matched": False, "item": item, "score": 0}
+
+
+def cache_match_sort_key(match: Dict[str, Any]) -> Tuple[int, int, int, int]:
+    item = match.get("item") if isinstance(match.get("item"), dict) else {}
+    return (
+        int(match.get("score") or 0),
+        int(item.get("year") or 0),
+        source_url_score(str(item.get("source_url") or "")),
+        len(str(match.get("matched_alias") or "")),
+    )
+
+
+def local_status_item_aliases(item: Dict[str, Any]) -> List[str]:
+    values: List[Any] = []
+    level = normalize_admin_level(item.get("admin_level"))
+    values.append(item.get("admin_division"))
+    if level in {"county", "county_city", "district"}:
+        values.append(item.get("county") or item.get("district") or item.get("county_city"))
+    elif level == "city":
+        values.append(item.get("city"))
+    elif level == "province":
+        values.append(item.get("province"))
+    values.extend(item.get("admin_division_aliases") or [])
+    values.extend(item.get("aliases") or [])
+    values.extend(item.get("admin_codes") or [])
+    return unique_ordered(values)
+
+
+def admin_alias_relation(admin_division: str, candidate: str, alias: str) -> str:
+    admin_text = normalize_admin_text(admin_division)
+    candidate_text = normalize_admin_text(candidate)
+    alias_text = normalize_admin_text(alias)
+    if not alias_text:
+        return ""
+    if alias_text == admin_text:
+        return "exact_admin"
+    if alias_text == candidate_text:
+        return "exact_candidate"
+    if alias_text in admin_text:
+        return "alias_in_admin"
+    if admin_text and admin_text in alias_text:
+        return "admin_in_alias"
+    return ""
+
+
+def relation_score(relation: str) -> int:
+    return {
+        "exact_admin": 1000,
+        "exact_candidate": 900,
+        "alias_in_admin": 700,
+        "admin_in_alias": 650,
+    }.get(relation, 0)
+
+
+def admin_match_score(admin_division: str, item: Dict[str, Any]) -> int:
+    return int(build_cache_match(admin_division, item).get("score") or 0)
+
+
+def read_local_status_cache() -> Dict[str, Any]:
+    if not LOCAL_STATUS_CACHE_PATH.exists():
+        return {"items": []}
+    try:
+        payload = json.loads(LOCAL_STATUS_CACHE_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"items": []}
+    return payload if isinstance(payload, dict) else {"items": []}
+
+
+def build_local_status_search_query(admin_division: str) -> str:
+    admin_text = str(admin_division or "").strip()
+    candidates = extract_admin_search_candidates(admin_text)
+    return "；".join(f"{candidate} 最新 生态环境状况公报 地表水 水质" for candidate in candidates)
+
+
+def extract_admin_search_candidates(admin_division: str) -> List[str]:
+    admin_text = normalize_admin_text(admin_division)
+    if not admin_text:
+        return ["当地"]
+    parsed = parse_admin_division(admin_text)
+    candidates = [admin_text]
+    for key in ("county", "city", "province"):
+        value = parsed.get(key)
+        if value and value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
+def parse_admin_division(admin_division: str) -> Dict[str, Any]:
+    admin_text = normalize_admin_text(admin_division)
+    province = regex_first(r"^(.+?(?:省|自治区))", admin_text)
+    rest = admin_text[len(province):] if province else admin_text
+    county = regex_first(r"([^省市县区]+?(?:县|区|旗))$", rest)
+    city_part = rest[: -len(county)] if county else rest
+    cities = re.findall(r"[^市]+?市|[^州]+?自治州|[^区]+?地区|[^盟]+?盟", city_part)
+    city = ""
+    if len(cities) >= 2:
+        county = cities[-1]
+        city = cities[-2]
+    elif len(cities) == 1:
+        city = cities[0]
+
+    raw_level = infer_admin_level(county) if county else ("city" if city else ("province" if province else infer_admin_level(admin_text)))
+    candidate_levels = {
+        admin_text: raw_level,
+    }
+    if county:
+        candidate_levels[county] = infer_admin_level(county)
+    if city:
+        candidate_levels[city] = "city"
+    if province:
+        candidate_levels[province] = "province"
+    return {
+        "raw": admin_text,
+        "province": province,
+        "city": city,
+        "county": county,
+        "candidate_levels": candidate_levels,
+    }
+
+
+def regex_first(pattern: str, text: str) -> str:
+    match = re.search(pattern, text or "")
+    return match.group(1) if match else ""
+
+
+def normalize_admin_text(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+def infer_admin_level(value: Any) -> str:
+    text = normalize_admin_text(value)
+    if not text:
+        return "unknown"
+    if text.endswith(("县", "旗")):
+        return "county"
+    if text.endswith("区"):
+        return "district"
+    if text.endswith("市"):
+        return "county_city" if len(text) <= 4 else "city"
+    if text.endswith(("省", "自治区")):
+        return "province"
+    return "unknown"
+
+
+def normalize_admin_level(value: Any) -> str:
+    text = str(value or "").strip()
+    aliases = {
+        "county-level city": "county_city",
+        "county_city": "county_city",
+        "county": "county",
+        "district": "district",
+        "city": "city",
+        "province": "province",
+        "县级市": "county_city",
+        "县": "county",
+        "区": "district",
+        "市": "city",
+        "省": "province",
+    }
+    return aliases.get(text, infer_admin_level(text))
 
 
 def build_docx(
@@ -300,27 +950,29 @@ def build_docx(
     table3: Dict[str, Any],
     factor_list: List[str],
     evaluated_factors: List[str],
-    conclusion: str,
+    texts: Dict[str, str],
 ) -> Document:
     doc = Document()
     setup_document(doc)
 
     doc.add_heading("1.1.1 地表水环境现状调查与评价", level=1)
-    doc.add_heading("1.1.1.1 水环境质量现状调查", level=2)
+    local_status_text = texts.get("local_status_text", "").strip()
+    if local_status_text:
+        doc.add_heading("1.1.1.1 区域地表水环境质量现状", level=2)
+        doc.add_paragraph(local_status_text)
+
+    doc.add_heading("1.1.1.2 水环境质量现状调查", level=2)
 
     add_numbered_title(doc, "（1）现状监测点布置")
-    doc.add_paragraph(
-        f"根据项目所在区域的水文特征、河流水体规模，共计在评价范围设置了"
-        f"{len(table1['rows'])}个监测断面进行水质监测。监测断面概况详见表4.2-4。"
-    )
+    doc.add_paragraph(texts.get("monitor_points_text") or "-")
     add_caption(doc, table1["title"])
     add_table(doc, table1["headers"], table1["rows"])
 
     add_numbered_title(doc, "（2）监测时间、频率和方法")
-    doc.add_paragraph(build_monitoring_description(table1, factor_list))
+    doc.add_paragraph(texts.get("monitoring_time_method_text") or "-")
 
     add_numbered_title(doc, "（3）现状监测结果")
-    doc.add_paragraph("本项目地表水监测结果详见表4.2-5。")
+    doc.add_paragraph(texts.get("monitoring_result_text") or "-")
     add_caption(doc, table2["title"])
     add_table(doc, table2["headers"], table2["rows"])
 
@@ -328,12 +980,254 @@ def build_docx(
     add_subtitle(doc, "①评价方法")
     add_evaluation_method_text(doc)
     add_subtitle(doc, "②评价结果")
-    doc.add_paragraph("地表水监测点位环境现状评价结果见表4.2-6。")
+    doc.add_paragraph(texts.get("evaluation_result_intro") or "-")
     add_caption(doc, table3["title"])
     add_table(doc, table3["headers"], table3["rows"])
 
-    doc.add_paragraph(conclusion)
+    doc.add_paragraph(texts.get("conclusion") or "-")
     return doc
+
+
+def polish_surface_water_text_with_llm(
+    rule_texts: Dict[str, str],
+    table1: Dict[str, Any],
+    table2: Dict[str, Any],
+    table3: Dict[str, Any],
+    factor_list: List[str],
+    evaluated_factors: List[str],
+    results: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    payload = {
+        "enabled": ENABLE_LLM_TEXT_POLISH,
+        "reference_text": read_reference_surface_water_text(),
+        "text_guidance": load_text_polish_guidance(),
+        "rule_texts": rule_texts,
+        "summary": build_surface_water_summary(table1, table2, factor_list, evaluated_factors, results),
+        "table_stats": {
+            "monitor_points": len(table1.get("rows", [])),
+            "monitor_result_rows": len(table2.get("rows", [])),
+            "compliance_rows": len(table3.get("rows", [])),
+        },
+    }
+    write_json(DEBUG_DIR / "surface_water_llm_text_input.json", payload)
+
+    if not ENABLE_LLM_TEXT_POLISH:
+        validation = {"used_llm": False, "valid": True, "warnings": ["ENABLE_LLM_TEXT_POLISH=false"]}
+        write_json(DEBUG_DIR / "surface_water_llm_text_output.json", {})
+        write_json(DEBUG_DIR / "surface_water_llm_text_validation.json", validation)
+        return rule_texts
+
+    if not os.getenv("EIA_LLM_API_KEY"):
+        validation = {"used_llm": False, "valid": False, "warnings": ["EIA_LLM_API_KEY is missing"]}
+        write_json(DEBUG_DIR / "surface_water_llm_text_output.json", {})
+        write_json(DEBUG_DIR / "surface_water_llm_text_validation.json", validation)
+        return rule_texts
+
+    try:
+        polished = call_text_polish_llm(build_text_polish_prompt(payload))
+        validation = validate_polished_text(polished, rule_texts, results)
+        write_json(DEBUG_DIR / "surface_water_llm_text_output.json", polished)
+        write_json(DEBUG_DIR / "surface_water_llm_text_validation.json", validation)
+        if validation["valid"]:
+            return {**rule_texts, **{key: str(polished[key]).strip() for key in rule_texts}}
+        return rule_texts
+    except Exception as exc:
+        write_json(DEBUG_DIR / "surface_water_llm_text_output.json", {})
+        write_json(
+            DEBUG_DIR / "surface_water_llm_text_validation.json",
+            {"used_llm": True, "valid": False, "warnings": [str(exc)]},
+        )
+        return rule_texts
+
+
+def build_surface_water_summary(
+    table1: Dict[str, Any],
+    table2: Dict[str, Any],
+    factor_list: List[str],
+    evaluated_factors: List[str],
+    results: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    exceed_items = [
+        {
+            "river_name": item.get("river_name"),
+            "point_code": item.get("point_code"),
+            "sample_date": item.get("sample_date"),
+            "factor": normalize_factor(item.get("factor")),
+            "standard_index": item.get("standard_index"),
+        }
+        for item in results
+        if item.get("is_compliant") is False
+    ]
+    return {
+        "monitor_point_count": len(table1.get("rows", [])),
+        "monitor_dates": unique_ordered(row.get("监测时间") for row in table2.get("rows", [])),
+        "factor_list": factor_list,
+        "evaluated_factors": evaluated_factors,
+        "exceed_items": exceed_items,
+    }
+
+
+def read_reference_surface_water_text() -> List[str]:
+    reference_path = Path("D:/") / "华设" / "智能体" / "环评报告" / "输出" / "台儿庄高速" / "地表水环境现状调查与评价.docx"
+    if not reference_path.exists():
+        return []
+    try:
+        doc = Document(str(reference_path))
+    except Exception:
+        return []
+    texts = []
+    for paragraph in doc.paragraphs:
+        text = paragraph.text.strip()
+        if text:
+            texts.append(text)
+    return texts[:80]
+
+
+def load_text_polish_guidance() -> Dict[str, Any]:
+    if not TEXT_POLISH_GUIDANCE_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(TEXT_POLISH_GUIDANCE_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {
+            "config_error": f"{TEXT_POLISH_GUIDANCE_PATH} 不是合法 JSON，已忽略该配置。",
+        }
+    if not isinstance(payload, dict):
+        return {
+            "config_error": f"{TEXT_POLISH_GUIDANCE_PATH} 顶层必须是 JSON 对象，已忽略该配置。",
+        }
+    return payload
+
+
+def build_text_polish_prompt(payload: Dict[str, Any]) -> str:
+    return (
+        "你是环评报告地表水环境章节文字润色助手。只润色文字，不修改任何数字、表号、断面编号、监测日期、标准名称或达标/超标结论。\n"
+        "请参考 reference_text 的中文报告风格，并严格遵循 text_guidance 中可维护的写作要点，润色 rule_texts 中的字段。\n"
+        "text_guidance 是项目配置项，优先级高于 reference_text；如果二者冲突，以 text_guidance 和 rule_texts 的事实数据为准。\n"
+        "输出必须是 JSON 对象，键名必须完整保留：local_status_text, monitor_points_text, monitoring_time_method_text, monitoring_result_text, evaluation_result_intro, conclusion。\n"
+        "禁止输出 Markdown；不得编造生态环境公报内容、监测单位、监测日期、断面数量、评价因子或超标事实。\n"
+        f"输入数据：\n{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+
+def call_text_polish_llm(prompt: str) -> Dict[str, Any]:
+    endpoint = os.getenv("EIA_LLM_ENDPOINT", DEFAULT_ENDPOINT)
+    model = os.getenv("EIA_LLM_MODEL", "qwen-plus")
+    request_payload = {
+        "model": model,
+        "temperature": 0.2,
+        "max_tokens": int(os.getenv("EIA_LLM_TEXT_MAX_TOKENS", "1800")),
+        "messages": [
+            {
+                "role": "system",
+                "content": "你只输出合法 JSON 对象，不输出解释。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+    }
+    last_error: Optional[Exception] = None
+    for attempt in range(1, LLM_MAX_RETRIES + 1):
+        started = time.time()
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(request_payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {os.getenv('EIA_LLM_API_KEY')}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            print(f"Surface water LLM text polish attempt {attempt}/{LLM_MAX_RETRIES}", flush=True)
+            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT_SECONDS, context=SSL_CONTEXT) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            content = data["choices"][0]["message"]["content"]
+            parsed = parse_json_object(content)
+            print(f"Surface water LLM text polish succeeded in {int((time.time() - started) * 1000)}ms", flush=True)
+            return parsed
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            KeyError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as exc:
+            last_error = exc
+            print(f"Surface water LLM text polish failed on attempt {attempt}/{LLM_MAX_RETRIES}: {exc}", flush=True)
+            if attempt < LLM_MAX_RETRIES:
+                time.sleep(LLM_RETRY_DELAY_SECONDS * attempt)
+    raise RuntimeError(f"Surface water LLM text polish failed: {last_error}")
+
+
+def parse_json_object(content: str) -> Dict[str, Any]:
+    text = content.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end >= start:
+        text = text[start:end + 1]
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("Surface water LLM text polish response must be a JSON object")
+    return parsed
+
+
+def validate_polished_text(
+    polished: Dict[str, Any],
+    rule_texts: Dict[str, str],
+    results: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    warnings: List[str] = []
+    for key in rule_texts:
+        if not isinstance(polished.get(key), str) or not polished.get(key, "").strip():
+            warnings.append(f"missing or empty field: {key}")
+
+    all_text = "\n".join(str(polished.get(key, "")) for key in rule_texts)
+    for pattern in ("表4.2-4", "表4.2-5", "表4.2-6"):
+        if pattern in "\n".join(rule_texts.values()) and pattern not in all_text:
+            warnings.append(f"missing table reference: {pattern}")
+
+    exceed_items = [item for item in results if item.get("is_compliant") is False]
+    conclusion = str(polished.get("conclusion", ""))
+    if exceed_items and has_unqualified_all_compliant_claim(conclusion):
+        warnings.append("conclusion says all compliant despite exceed items")
+    for item in exceed_items:
+        point = str(item.get("point_code") or "")
+        factor = normalize_factor(item.get("factor"))
+        if point and point not in all_text:
+            warnings.append(f"missing exceed point: {point}")
+        if factor and factor not in all_text:
+            warnings.append(f"missing exceed factor: {factor}")
+
+    return {"used_llm": True, "valid": not warnings, "warnings": warnings}
+
+
+def has_unqualified_all_compliant_claim(conclusion: str) -> bool:
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"[。；;]", str(conclusion or ""))
+        if sentence.strip()
+    ]
+    for sentence in sentences:
+        if is_qualified_compliant_sentence(sentence):
+            continue
+        if re.search(r"(全部|全[部市县区]?[^\s，,。；;]{0,12}|所有|各监测点位|各断面|各监测断面).*?(均满足|均达标|均符合|均达到|全部达标)", sentence):
+            return True
+        if "均满足" in sentence or "均达标" in sentence or "全部达标" in sentence:
+            return True
+    return False
+
+
+def is_qualified_compliant_sentence(sentence: str) -> bool:
+    text = re.sub(r"\s+", "", sentence or "")
+    if re.search(r"除[^。；;]*(超标|不达标|超过)[^。；;]*外", text):
+        return True
+    if re.search(r"(其余|其他|其余各项|其他评价因子|其余评价因子|非超标因子)", text):
+        return True
+    return False
 
 
 def setup_document(doc: Document) -> None:

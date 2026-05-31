@@ -111,23 +111,36 @@ def parse_standard_config(plan_path: Path) -> Dict[str, Any]:
         if not rows:
             continue
         headers = rows[0]
+        header_map = build_header_map(headers)
         for row in rows[1:]:
             if len(row) < 4:
                 continue
-            point_code = extract_point_code(row[0])
-            standard_class = normalize_standard_class(row[3])
+            point_code = extract_point_code(get_row_value(row, header_map, "序号", 0))
+            standard_class = normalize_standard_class(
+                get_row_value(row, header_map, "评价标准", None)
+                or get_row_value(row, header_map, "水质目标", None)
+                or get_row_value(row, header_map, "标准", 3)
+            )
             if not point_code:
                 continue
             if not standard_class:
                 warnings.append(f"{point_code} 未识别到标准类别: {row}")
                 continue
-            river_name = row[1].strip() if len(row) > 1 else None
+            river_name = (
+                get_row_value(row, header_map, "河流名称", None)
+                or get_row_value(row, header_map, "河流", None)
+                or get_row_value(row, header_map, "水体", None)
+            )
             points[point_code] = {
                 "point_code": point_code,
                 "river_name": river_name,
                 "standard_name": STANDARD_NAME,
                 "standard_class": standard_class,
-                "section_name": row[4].strip() if len(row) > 4 else None,
+                "section_name": (
+                    get_row_value(row, header_map, "取样断面", None)
+                    or get_row_value(row, header_map, "监测断面", None)
+                    or get_row_value(row, header_map, "断面", 4)
+                ),
                 "source_table": chunk.get("chunk_id"),
                 "evidence": row_to_evidence(headers, row),
                 "limits": LIMITS.get(standard_class, {}),
@@ -240,7 +253,7 @@ def evaluate_compliance(
                 warnings.append("未找到同点位同日期水温，无法计算 DO 标准指数")
             else:
                 standard_index = calc_do_index(value, float(limit_value), float(temperature))
-                is_compliant = value >= float(limit_value)
+                is_compliant = standard_index <= 1
         elif factor in {"高锰酸盐指数", "氨氮", "总磷", "石油类"}:
             method = "value_div_limit"
             limit_value = LIMITS[standard_class][factor]
@@ -283,6 +296,27 @@ def parse_table_rows(table_text: str) -> List[List[str]]:
     return rows
 
 
+def build_header_map(headers: List[str]) -> Dict[str, int]:
+    return {str(header or "").strip(): index for index, header in enumerate(headers)}
+
+
+def get_row_value(
+    row: List[str],
+    header_map: Dict[str, int],
+    header_keyword: str,
+    fallback_index: Optional[int],
+) -> Optional[str]:
+    for header, index in header_map.items():
+        if header_keyword in header and index < len(row):
+            value = row[index].strip()
+            if value:
+                return value
+    if fallback_index is not None and fallback_index < len(row):
+        value = row[fallback_index].strip()
+        return value or None
+    return None
+
+
 def row_to_evidence(headers: List[str], row: List[str]) -> Dict[str, Any]:
     evidence: Dict[str, Any] = {}
     for index, value in enumerate(row):
@@ -292,7 +326,9 @@ def row_to_evidence(headers: List[str], row: List[str]) -> Dict[str, Any]:
 
 
 def extract_point_code(text: str) -> Optional[str]:
-    match = re.search(r"\bWJ\d+\b", text or "")
+    match = re.search(r"(?<![A-Za-z0-9])WJ\s*\d+", text or "", flags=re.IGNORECASE)
+    if match:
+        return re.sub(r"\s+", "", match.group(0)).upper()
     return match.group(0) if match else None
 
 

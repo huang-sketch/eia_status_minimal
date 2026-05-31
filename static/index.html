@@ -292,6 +292,14 @@
       padding: 0 14px 14px;
     }
     .label { color: var(--muted); }
+    .llm-state {
+      font-weight: 700;
+    }
+    .llm-state.success { color: var(--ok); }
+    .llm-state.failed { color: var(--bad); }
+    .llm-state.pending { color: var(--warn); }
+    .llm-state.not_enabled,
+    .llm-state.unknown { color: var(--muted); }
     pre {
       max-height: 260px;
       overflow: auto;
@@ -359,6 +367,7 @@
           <div class="label">当前状态</div><div id="statusText">等待中</div>
           <div class="label">当前步骤</div><div id="stepText">-</div>
           <div class="label">错误信息</div><div id="errorText">-</div>
+          <div class="label">LLM 文本润色</div><div id="llmTextPolishText">未启用</div>
         </div>
         <pre id="logs"></pre>
       </details>
@@ -466,6 +475,7 @@
       setText("statusText", statusLabel(status.status));
       setText("stepText", status.current_step || "-");
       setText("errorText", status.error || "-");
+      renderLlmTextPolishStatus(status.llm_text_polish || {});
       setText("logs", logs || "");
 
       if (status.status === "success" || status.status === "failed") {
@@ -493,6 +503,16 @@
       renderTable("noiseSensitive", preview.compliance.noise_sensitive, "noise_compliance");
       renderTable("noiseAttenuation", preview.compliance.noise_attenuation, "noise_compliance");
       renderNoiseSummary(preview.compliance.noise_summary || {});
+      renderLlmTextPolishStatus(preview.llm_text_polish || {});
+    }
+
+    function renderLlmTextPolishStatus(llmStatus) {
+      const target = document.getElementById("llmTextPolishText");
+      const state = llmStatus.state || "unknown";
+      const warnings = Array.isArray(llmStatus.warnings) ? llmStatus.warnings.filter(Boolean) : [];
+      const detail = warnings.length ? `：${warnings.join("；")}` : "";
+      target.className = `llm-state ${state}`;
+      target.textContent = `${llmStatus.label || "暂无结果"}${detail}`;
     }
 
     function renderTable(containerId, table, tableType) {
