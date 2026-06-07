@@ -1,10 +1,12 @@
 import copy
-import shutil
 from pathlib import Path
 from typing import Iterable, List
 
 from docx import Document
 from docx.enum.text import WD_BREAK
+
+from docx_layout import strip_document_list_numbering
+from docx_numbering import generation_order, section_docx_path
 
 
 COMBINED_SECTION_FILENAME = "现状调查与评价.docx"
@@ -15,21 +17,29 @@ SURFACE_WATER_SECTION_FILENAME = "surface_water_section.docx"
 
 def build_combined_section_docx(output_dir: Path) -> Path:
     output_dir = Path(output_dir)
-    overview_path = output_dir / PROJECT_AREA_OVERVIEW_FILENAME
-    noise_path = output_dir / NOISE_SECTION_FILENAME
-    surface_water_path = output_dir / SURFACE_WATER_SECTION_FILENAME
     combined_path = output_dir / COMBINED_SECTION_FILENAME
+    existing = list_existing_section_docx_paths(output_dir)
 
-    existing = [path for path in (overview_path, noise_path, surface_water_path) if path.exists()]
     if not existing:
         raise FileNotFoundError("未找到可合并的项目区域概况、声环境或地表水 Word 章节")
 
     if len(existing) == 1:
-        shutil.copyfile(existing[0], combined_path)
+        doc = Document(str(existing[0]))
+        strip_document_list_numbering(doc)
+        doc.save(combined_path)
         return combined_path
 
     combine_docx_files(existing, combined_path)
     return combined_path
+
+
+def list_existing_section_docx_paths(output_dir: Path) -> List[Path]:
+    output_dir = Path(output_dir)
+    return [
+        section_docx_path(output_dir, section_key)
+        for section_key in generation_order()
+        if section_docx_path(output_dir, section_key).exists()
+    ]
 
 
 def combine_docx_files(paths: List[Path], output_path: Path) -> None:
@@ -37,6 +47,7 @@ def combine_docx_files(paths: List[Path], output_path: Path) -> None:
     for path in paths[1:]:
         add_page_break(first_doc)
         append_body_elements(first_doc, Document(str(path)))
+    strip_document_list_numbering(first_doc)
     first_doc.save(str(output_path))
 
 

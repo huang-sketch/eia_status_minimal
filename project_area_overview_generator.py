@@ -1,10 +1,6 @@
-import http.client
 import json
 import os
 import re
-import time
-import urllib.error
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
@@ -12,17 +8,10 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from dotenv import load_dotenv
 from docx import Document
-from docx.enum.section import WD_ORIENT
-from docx.oxml.ns import qn
-from docx.shared import Cm, Pt, RGBColor
 
-from llm_extractor import (
-    DEFAULT_ENDPOINT,
-    LLM_MAX_RETRIES,
-    LLM_RETRY_DELAY_SECONDS,
-    LLM_TIMEOUT_SECONDS,
-    SSL_CONTEXT,
-)
+from docx_layout import add_body_paragraph, add_chapter_title, add_section_heading, create_section_document, finalize_section_document, setup_document
+from docx_numbering import DocxNumbering, load_numbering
+from llm_client import LlmProfile, chat_completion_json_object
 
 
 load_dotenv()
@@ -119,6 +108,7 @@ def main() -> None:
             "sections": sections,
         })
         doc = build_docx(payload)
+        finalize_section_document(doc)
         doc.save(OUTPUT_DOCX)
         write_status(generation["status"], None, admin_division, report_name, length_profile, generation.get("warnings", []))
         print(f"generated: {OUTPUT_DOCX}")
@@ -274,7 +264,7 @@ def remove_stale_docx() -> None:
 def generate_sections_with_retry(llm_input: Dict[str, Any]) -> Dict[str, Any]:
     attempts: List[Dict[str, Any]] = []
     first_prompt = build_prompt(llm_input)
-    raw_output = call_overview_llm(first_prompt)
+    raw_output = request_overview_json(first_prompt)
     sections = normalize_llm_sections(raw_output)
     errors, warnings = validate_sections(sections)
     attempts.append(
@@ -296,7 +286,7 @@ def generate_sections_with_retry(llm_input: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     retry_prompt = build_retry_prompt(llm_input, sections, errors, warnings)
-    retry_output = call_overview_llm(retry_prompt)
+    retry_output = request_overview_json(retry_prompt)
     retry_sections = normalize_llm_sections(retry_output)
     retry_errors, retry_warnings = validate_sections(retry_sections)
     attempts.append(
@@ -379,72 +369,21 @@ def build_retry_prompt(
     )
 
 
-def call_overview_llm(prompt: str) -> Dict[str, Any]:
-    endpoint = os.getenv("EIA_LLM_ENDPOINT", DEFAULT_ENDPOINT)
-    model = os.getenv("EIA_LLM_MODEL", "qwen-plus")
-    request_payload = {
-        "model": model,
-        "temperature": 0.2,
-        "max_tokens": int(os.getenv("EIA_PROJECT_OVERVIEW_MAX_TOKENS", "3500")),
-        "messages": [
-            {
-                "role": "system",
-                "content": "你是严谨的环评报告写作助手，只输出符合要求的 JSON。",
-            },
-            {"role": "user", "content": prompt},
-        ],
-    }
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(request_payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {os.getenv('EIA_LLM_API_KEY')}",
-        },
-        method="POST",
-    )
-    last_error: Optional[Exception] = None
-    for attempt in range(LLM_MAX_RETRIES + 1):
-        try:
-            started = time.time()
-            with urllib.request.urlopen(
-                request,
-                timeout=LLM_TIMEOUT_SECONDS,
-                context=SSL_CONTEXT,
-            ) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            content = data["choices"][0]["message"]["content"]
-            parsed = parse_json_object(content)
-            print(f"Project area overview LLM succeeded in {int((time.time() - started) * 1000)}ms", flush=True)
-            return parsed
-        except (
-            urllib.error.URLError,
-            TimeoutError,
-            http.client.RemoteDisconnected,
-            http.client.IncompleteRead,
-            json.JSONDecodeError,
-            KeyError,
-            ValueError,
-        ) as exc:
-            last_error = exc
-            if attempt < LLM_MAX_RETRIES:
-                time.sleep(LLM_RETRY_DELAY_SECONDS)
-    raise LlmCallError(f"项目区域环境概况 LLM 调用失败：{last_error}")
-
-
-def parse_json_object(content: str) -> Dict[str, Any]:
-    text = str(content or "").strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("LLM 响应中没有 JSON 对象")
-    payload = json.loads(text[start : end + 1])
-    if not isinstance(payload, dict):
-        raise ValueError("LLM 响应 JSON 不是对象")
-    return payload
+def request_overview_json(prompt: str) -> Dict[str, Any]:
+    try:
+        return chat_completion_json_object(
+            [
+                {
+                    "role": "system",
+                    "content": "你是严谨的环评报告写作助手，只输出符合要求的 JSON。",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            profile=LlmProfile.project_overview,
+            label="project_area_overview",
+        )
+    except RuntimeError as exc:
+        raise LlmCallError(str(exc)) from exc
 
 
 def normalize_llm_sections(payload: Dict[str, Any]) -> Dict[str, List[str]]:
@@ -507,44 +446,19 @@ def english_ratio(text: str) -> float:
     return len(letters) / max(len(value), 1)
 
 
-def build_docx(payload: Dict[str, Any]) -> Document:
-    doc = Document()
+def build_docx(payload: Dict[str, Any], numbering: Optional[DocxNumbering] = None) -> Document:
+    numbering = numbering or load_numbering(OUTPUT_DIR)
+    numbering.begin_section("overview", "项目区域环境概况")
+    doc = create_section_document()
     setup_document(doc)
-    doc.add_heading("项目区域环境概况", level=1)
+    add_chapter_title(doc, numbering.section_title("overview", "项目区域环境概况"))
     for section in payload.get("sections", []):
-        doc.add_heading(section.get("title") or "-", level=2)
+        title = section.get("title") or "-"
+        add_section_heading(doc, numbering.next_level2_heading("overview", title))
         for paragraph in section.get("paragraphs", []):
             if paragraph:
-                doc.add_paragraph(paragraph)
+                add_body_paragraph(doc, paragraph)
     return doc
-
-
-def setup_document(doc: Document) -> None:
-    section = doc.sections[0]
-    section.orientation = WD_ORIENT.LANDSCAPE
-    section.page_width, section.page_height = section.page_height, section.page_width
-    section.top_margin = Cm(1.8)
-    section.bottom_margin = Cm(1.8)
-    section.left_margin = Cm(1.6)
-    section.right_margin = Cm(1.6)
-
-    styles = doc.styles
-    normal = styles["Normal"]
-    normal.font.name = "宋体"
-    normal._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-    normal.font.size = Pt(10.5)
-    normal.font.color.rgb = RGBColor(0, 0, 0)
-
-    for style_name, font_name, size in [
-        ("Heading 1", "黑体", 14),
-        ("Heading 2", "黑体", 12),
-        ("Heading 3", "黑体", 11),
-    ]:
-        style = styles[style_name]
-        style.font.name = font_name
-        style._element.rPr.rFonts.set(qn("w:eastAsia"), font_name)
-        style.font.size = Pt(size)
-        style.font.color.rgb = RGBColor(0, 0, 0)
 
 
 def unique_ordered(items: Iterable[Any]) -> List[str]:
@@ -557,6 +471,33 @@ def unique_ordered(items: Iterable[Any]) -> List[str]:
         seen.add(text)
         result.append(text)
     return result
+
+
+def rebuild_docx_from_output(output_dir: Path, numbering: DocxNumbering) -> Path:
+    output_dir = Path(output_dir)
+    os.environ["EIA_OUTPUT_DIR"] = str(output_dir)
+    text_path = output_dir / "debug_tables" / "project_area_overview_text.json"
+    if not text_path.exists():
+        raise FileNotFoundError(f"缺少概况文本缓存: {text_path}")
+
+    payload = json.loads(text_path.read_text(encoding="utf-8"))
+    sections = payload.get("sections") if isinstance(payload, dict) else {}
+    if not isinstance(sections, dict):
+        sections = {}
+
+    doc_payload = {
+        "sections": [
+            {"title": title, "paragraphs": sections.get(title) or []}
+            for title in SECTION_TITLES
+        ],
+    }
+    numbering.begin_section("overview", "项目区域环境概况")
+    numbering.reset_section_heading_counters("overview")
+    doc = build_docx(doc_payload, numbering)
+    finalize_section_document(doc)
+    out_path = output_dir / "project_area_overview.docx"
+    doc.save(out_path)
+    return out_path
 
 
 if __name__ == "__main__":

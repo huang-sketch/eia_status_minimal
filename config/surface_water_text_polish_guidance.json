@@ -1,8 +1,8 @@
 {
   "name": "surface_water_text_polish_guidance",
-  "version": 1,
+  "version": 2,
   "source_reference": {
-    "description": "地表水环境章节润色参考报告。该路径用于说明风格来源，实际生成优先遵循本配置和 rule_texts 的事实数据。",
+    "description": "风格样本已从参考报告提炼为 style_exemplars，运行时不再读取 docx。",
     "path": "D:/华设/智能体/环评报告/输出/台儿庄高速/地表水环境现状调查与评价.docx"
   },
   "writing_goals": [
@@ -10,53 +10,111 @@
     "文本重点说明监测断面布置、监测时间和频次、监测结果、评价方法、评价结果和达标结论。",
     "优先使用 rule_texts 和 summary 中已经计算出的事实、数字、表号、断面编号、监测日期、评价因子和达标/超标判断。"
   ],
+  "style_exemplars": {
+    "local_status_text": {
+      "role": "区域地表水环境质量概况（生态环境状况公报）",
+      "example": "根据《2024年徐州市生态环境状况公报》，2024年，徐州市地表水环境质量总体稳定，国省考断面优Ⅲ比例、集中式饮用水水源水质等符合相关要求。",
+      "length_chars": "120-280",
+      "sentences": "1-2",
+      "must_keep": [],
+      "notes": "仅润色 rule_texts 中已有公报内容；若为空则保持为空，不得编造。"
+    },
+    "monitor_points_text": {
+      "role": "监测断面布置",
+      "example": "根据项目所在区域的水文特征、河流水体规模，共计在评价范围设置了5个监测断面进行水质监测。监测断面概况详见表4.2-4。",
+      "length_chars": "45-75",
+      "sentences": "1-2",
+      "must_keep": ["监测断面概况详见表4.2-4"],
+      "notes": "断面数量、河流名称须与本次 rule_texts 一致。"
+    },
+    "monitoring_time_method_text": {
+      "role": "监测时间、频率和方法",
+      "example": "华设设计集团环境科技有限公司于2025年5月14日~2025年5月16日对沿线的地表水监测断面进行连续三天、每天一次的现状监测。断面垂线和采样点的布设按照国家环保总局颁布的《环境监测技术规范（水和废水部分）》中的规定进行。",
+      "length_chars": "90-130",
+      "sentences": "2-3",
+      "must_keep": [],
+      "notes": "监测单位、日期、频次须来自 rule_texts；检测方法可概括表述。"
+    },
+    "monitoring_result_text": {
+      "role": "现状监测结果引述",
+      "example": "华设设计集团环境科技有限公司于2025年5月14日~2025年5月16日对项目沿线的地表水监测断面进行了现状监测。本项目地表水监测结果详见表4.2-5。",
+      "length_chars": "35-120",
+      "sentences": "1-3",
+      "must_keep": ["表4.2-5"],
+      "notes": "开头优先说明监测单位和监测日期；不重复堆砌表格数值。"
+    },
+    "evaluation_result_intro": {
+      "role": "评价结果引表",
+      "example": "地表水监测点位环境现状评价结果见表4.2-6。",
+      "length_chars": "18-35",
+      "sentences": "1",
+      "must_keep": ["表4.2-6"],
+      "notes": "保持简短，不展开结论。"
+    },
+    "conclusion": {
+      "role": "达标/超标结论",
+      "example": "根据监测结果，京杭大运河、古房亭河、房亭河、民便河和废黄河的pH、高锰酸盐指数、氨氮、石油类、TP指标均满足《地表水环境质量标准》（GB3838-2002）Ⅲ类标准。",
+      "length_chars": "60-120",
+      "sentences": "2-4",
+      "must_keep": [],
+      "notes": "存在超标时先总述再分述超标断面与因子；超标原因用“受沿线生活污水/农业面源影响”等审慎概括，不编造具体排污源。"
+    }
+  },
+  "length_targets": {
+    "local_status_text": { "min_chars": 80, "max_chars": 280, "paragraphs": 1 },
+    "monitor_points_text": { "min_chars": 40, "max_chars": 90, "paragraphs": 1 },
+    "monitoring_time_method_text": { "min_chars": 80, "max_chars": 150, "paragraphs": 1 },
+    "monitoring_result_text": { "min_chars": 30, "max_chars": 130, "paragraphs": 1 },
+    "evaluation_result_intro": { "min_chars": 15, "max_chars": 40, "paragraphs": 1 },
+    "conclusion": { "min_chars": 50, "max_chars": 200, "paragraphs": 1 }
+  },
   "section_points": {
     "local_status_text": [
       "放在地表水章节最前面，说明项目所在行政区划上一年度或最新年度的地表水环境质量状况。",
       "优先使用当地生态环境状况公报、生态环境质量公报、政府或生态环境主管部门公开发布内容。",
-      "表述格式参考：“根据《2024年徐州市生态环境状况公报》，2024年，……”。",
+      "表述格式参考 style_exemplars.local_status_text.example。",
       "必须保留公报名称、年份、优Ⅲ比例、集中式饮用水水源水质、主要水体水质状况等关键事实。",
       "不得编造公报数据；如果 rule_texts 中该字段为空，LLM 不得自行生成。"
     ],
     "monitor_points_text": [
       "说明根据项目所在区域水文特征、河流水体规模和评价范围设置监测断面。",
       "明确监测断面数量，并保留“监测断面概况详见表4.2-4”等表述。",
-      "该段可参考 reference_text 中监测断面布置段落的句式和长度，但断面数量、河流名称、断面编号必须服从本次输入。"
+      "句式与长度参考 style_exemplars.monitor_points_text；断面数量、河流名称、断面编号必须服从本次输入。"
     ],
     "monitoring_time_method_text": [
       "说明监测时间、取样频次和监测因子。",
       "监测因子必须使用 rule_texts 中列出的因子，不得新增或删除。",
-      "检测方法可采用正式报告中的概括写法，如“各监测因子检测方法按监测报告及相关水质检测标准执行”。"
+      "句式与长度参考 style_exemplars.monitoring_time_method_text。"
     ],
     "monitoring_result_text": [
-      "段落开头优先说明监测单位和具体监测日期，句式参考 reference_text 中监测结果开头的写法。",
-      "监测单位和监测日期应优先从输入文本、rule_texts 或表格信息中提取；如果无法确认，不得编造具体单位或日期。",
-      "说明监测结果见表4.2-5，不重复堆砌所有监测值。",
-      "可简要概括各断面监测结果的总体情况，但不得新增没有表格支撑的数值范围。"
+      "段落开头优先说明监测单位和具体监测日期，句式参考 style_exemplars.monitoring_result_text.example。",
+      "监测单位和监测日期应优先从 rule_texts 或 summary 中提取；如果无法确认，不得编造。",
+      "说明监测结果见表4.2-5，不重复堆砌所有监测值。"
     ],
     "evaluation_result_intro": [
       "说明地表水监测点位环境现状评价结果见表4.2-6。",
-      "该字段应简短，不展开结论。"
+      "该字段应简短，不展开结论；长度参考 style_exemplars.evaluation_result_intro。"
     ],
     "conclusion": [
       "按评价结果给出达标或超标结论。",
-      "结论开头必须先用一句话概括总体情况，例如“总体满足相应水质类别标准要求”或“总体以达标为主，局部断面存在个别因子超标”。",
+      "结论开头必须先用一句话概括总体情况。",
       "达标情况按评价因子整体说明，不要逐批次、逐日期列出哪些点位达标。",
-      "无超标时，应说明所有监测点位的溶解氧、pH值、氨氮、总磷、高锰酸盐指数、石油类等具体评价因子均满足《地表水环境质量标准》（GB3838-2002）相应水质类别标准要求。",
+      "无超标时，应说明各评价因子均满足《地表水环境质量标准》（GB3838-2002）相应水质类别标准要求。",
       "存在超标时，先分析总体情况，再说明除超标因子外其余评价因子总体达标，然后明确超标断面、超标因子和监测日期。",
-      "存在超标时需要补充超标原因说明，原因表述应保持审慎，可参考 reference_text 中类似水环境超标原因的写法，不得编造具体排污源或治理措施。"
+      "存在超标时补充审慎的超标原因说明，参考 style_exemplars.conclusion.notes，不得编造具体排污源。"
     ]
   },
   "style_rules": [
-    "句式可参考“根据监测结果可知”“监测结果表明”“各监测断面”等报告常用表达。",
+    "句式可参考“根据监测结果可知”“监测结果表明”“各监测断面”“根据项目所在区域的水文特征”等报告常用表达。",
     "避免口语化、营销化、解释性过强或带主观判断的措辞。",
-    "段落不宜过长，每个字段保持为适合 Word 正文的一小段。",
+    "每个字段的字数应落在 length_targets 与 style_exemplars 的 length_chars 范围内，避免明显缩短或扩写。",
     "不得输出 Markdown、编号列表或项目符号。"
   ],
   "hard_constraints": [
     "不得修改任何数字、表号、标准名称、断面编号、监测日期、评价因子和达标/超标判断。",
     "不得新增没有输入依据的监测单位、工程背景、河流名称、断面名称或监测日期。",
     "不得删除 rule_texts 中已有的必要事实。",
+    "style_exemplars.example 中的示例事实不得照搬，仅模仿句式、长度和语气。",
     "如果配置和计算结果冲突，必须服从 rule_texts 和 summary。"
   ]
 }

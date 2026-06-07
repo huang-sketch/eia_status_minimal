@@ -6,6 +6,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from word_processor import load_docx_chunks
+from table_schema_mapper import apply_header_mapping, record_data_validation, resolve_table_schema
+
+EXTRACTION_RECORDS_FILENAME = "extraction/records.json"
 
 
 STANDARD_NAME = "地表水环境质量标准 GB3838-2002"
@@ -69,22 +72,62 @@ LIMITS: Dict[str, Dict[str, Any]] = {
 
 
 def main() -> None:
+    from record_adapter import (
+        adapt_cli_surface_water_records,
+        build_extraction_summary,
+        merge_cli_and_rule_records,
+    )
+
     input_dir = Path(os.getenv("EIA_INPUT_DIR", "input"))
     output_dir = Path(os.getenv("EIA_OUTPUT_DIR", "output"))
     output_dir.mkdir(parents=True, exist_ok=True)
+    debug_dir = output_dir / "debug_tables"
+    debug_dir.mkdir(parents=True, exist_ok=True)
 
     plan_path = find_docx(input_dir, "方案")
     report_path = find_docx(input_dir, "报告")
 
     standard_config = parse_standard_config(plan_path)
-    records = parse_surface_water_records(report_path)
+    extraction_records_path = output_dir / EXTRACTION_RECORDS_FILENAME
+    extraction_available = extraction_records_path.exists()
+    cli_raw_records = read_json(extraction_records_path) if extraction_available else []
+    if not isinstance(cli_raw_records, list):
+        cli_raw_records = []
+
+    cli_records = adapt_cli_surface_water_records(cli_raw_records)
+    rule_records = parse_surface_water_records(report_path)
+    records = merge_cli_and_rule_records(cli_records, rule_records)
+    write_json(
+        debug_dir / "extraction_summary.json",
+        build_extraction_summary(cli_records, rule_records, records, extraction_available),
+    )
     compliance_results = evaluate_compliance(records, standard_config)
+    data_warnings = list(standard_config.get("warnings") or [])
+    if records and not standard_config.get("points"):
+        data_warnings.append("已识别地表水监测数据，但监测方案中缺少可用水质目标")
+    missing_standard_points = sorted(
+        {
+            str(item.get("point_code") or "")
+            for item in compliance_results
+            if item.get("method") == "missing_standard" or not item.get("standard_class")
+        }
+    )
+    if missing_standard_points:
+        data_warnings.append("缺少水质目标: " + "、".join(item for item in missing_standard_points if item))
+    record_data_validation(
+        output_dir,
+        "surface_water_data",
+        valid=not data_warnings,
+        warnings=data_warnings,
+    )
 
     write_json(output_dir / "standard_config.json", standard_config)
     write_json(output_dir / "monitoring_records.json", records)
     write_json(output_dir / "compliance_results.json", compliance_results)
 
     print(f"standard_config: {len(standard_config['points'])} point(s)")
+    print(f"cli_records: {len(cli_records)} record(s)")
+    print(f"rule_records: {len(rule_records)} record(s)")
     print(f"monitoring_records: {len(records)} record(s)")
     print(f"compliance_results: {len(compliance_results)} result(s)")
 
@@ -111,13 +154,26 @@ def parse_standard_config(plan_path: Path) -> Dict[str, Any]:
         if not rows:
             continue
         headers = rows[0]
+        schema_result = resolve_table_schema(
+            "surface_water_plan",
+            headers,
+            sample_rows=rows[1:4],
+            table_title=str((chunk.get("metadata") or {}).get("table_title") or ""),
+            output_dir=Path(os.getenv("EIA_OUTPUT_DIR", "output")),
+            source_table=str(chunk.get("chunk_id") or ""),
+            job_id=Path(os.getenv("EIA_OUTPUT_DIR", "output")).parent.name,
+        )
+        if not schema_result["validation"]["valid"]:
+            continue
         header_map = build_header_map(headers)
         for row in rows[1:]:
             if len(row) < 4:
                 continue
-            point_code = extract_point_code(get_row_value(row, header_map, "序号", 0))
+            canonical = apply_header_mapping(headers, row, schema_result["mapping"])
+            point_code = extract_point_code(canonical.get("point_code") or get_row_value(row, header_map, "序号", 0))
             standard_class = normalize_standard_class(
-                get_row_value(row, header_map, "评价标准", None)
+                canonical.get("standard_class")
+                or get_row_value(row, header_map, "评价标准", None)
                 or get_row_value(row, header_map, "水质目标", None)
                 or get_row_value(row, header_map, "标准", 3)
             )
@@ -127,7 +183,8 @@ def parse_standard_config(plan_path: Path) -> Dict[str, Any]:
                 warnings.append(f"{point_code} 未识别到标准类别: {row}")
                 continue
             river_name = (
-                get_row_value(row, header_map, "河流名称", None)
+                canonical.get("river_name")
+                or get_row_value(row, header_map, "河流名称", None)
                 or get_row_value(row, header_map, "河流", None)
                 or get_row_value(row, header_map, "水体", None)
             )
@@ -137,7 +194,8 @@ def parse_standard_config(plan_path: Path) -> Dict[str, Any]:
                 "standard_name": STANDARD_NAME,
                 "standard_class": standard_class,
                 "section_name": (
-                    get_row_value(row, header_map, "取样断面", None)
+                    canonical.get("section_name")
+                    or get_row_value(row, header_map, "取样断面", None)
                     or get_row_value(row, header_map, "监测断面", None)
                     or get_row_value(row, header_map, "断面", 4)
                 ),
@@ -168,28 +226,40 @@ def parse_surface_water_records(report_path: Path) -> List[Dict[str, Any]]:
         if not rows:
             continue
         headers = rows[0]
+        schema_result = resolve_table_schema(
+            "surface_water_result",
+            headers,
+            sample_rows=rows[1:4],
+            table_title=table_title,
+            output_dir=Path(os.getenv("EIA_OUTPUT_DIR", "output")),
+            source_table=str(chunk.get("chunk_id") or ""),
+            job_id=Path(os.getenv("EIA_OUTPUT_DIR", "output")).parent.name,
+        )
+        if not schema_result["validation"]["valid"]:
+            continue
         for row in rows[1:]:
             if len(row) < 5:
                 continue
-            point = row[0].strip()
+            canonical = apply_header_mapping(headers, row, schema_result["mapping"])
+            point = (canonical.get("point") or row[0]).strip()
             point_code = extract_point_code(point)
-            factor = normalize_factor(row[2])
+            factor = normalize_factor(canonical.get("factor") or row[2])
             if not point_code or factor not in SURFACE_WATER_FACTORS:
                 continue
-            raw_value = row[4].strip()
+            raw_value = (canonical.get("value") or row[4]).strip()
             numeric_value, value_warning = parse_numeric_value(raw_value)
             record = {
                 "source_type": "监测报告",
                 "monitor_type": "surface_water",
                 "point_code": point_code,
                 "point": point,
-                "sample_date": row[1].strip(),
+                "sample_date": (canonical.get("sample_date") or row[1]).strip(),
                 "factor": factor,
-                "raw_factor": row[2].strip(),
+                "raw_factor": (canonical.get("factor") or row[2]).strip(),
                 "value": raw_value,
                 "numeric_value": numeric_value,
-                "unit": row[3].strip() if len(row) > 3 else None,
-                "sample_character": row[5].strip() if len(row) > 5 else None,
+                "unit": (canonical.get("unit") or row[3]).strip() if len(row) > 3 else None,
+                "sample_character": (canonical.get("sample_character") or row[5]).strip() if len(row) > 5 else None,
                 "evidence": row_to_evidence(headers, row),
                 "source_file": str(report_path),
                 "source_table": chunk.get("chunk_id"),
@@ -337,6 +407,22 @@ def normalize_standard_class(text: str) -> Optional[str]:
     for item in ("Ⅰ类", "Ⅱ类", "Ⅲ类", "Ⅳ类", "Ⅴ类"):
         if item in text:
             return item
+    chinese_mapping = {
+        "一类": "Ⅰ类",
+        "二类": "Ⅱ类",
+        "三类": "Ⅲ类",
+        "四类": "Ⅳ类",
+        "五类": "Ⅴ类",
+        "1类": "Ⅰ类",
+        "2类": "Ⅱ类",
+        "3类": "Ⅲ类",
+        "4类": "Ⅳ类",
+        "5类": "Ⅴ类",
+    }
+    compact_text = re.sub(r"\s+", "", text)
+    for key, value in chinese_mapping.items():
+        if key in compact_text:
+            return value
     mapping = {
         "I类": "Ⅰ类",
         "II类": "Ⅱ类",
@@ -390,7 +476,12 @@ def calc_do_index(value: float, limit: float, temperature: float) -> float:
 
 
 def write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

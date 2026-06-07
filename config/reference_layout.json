@@ -1,0 +1,41 @@
+{
+  "name": "台儿庄至睢宁环境现状调查与评价",
+  "source_docx": "D:/华设/智能体/环评报告/输入/排版skill/台儿庄至睢宁环境现状调查与评价.docx",
+  "page": {
+    "default_orientation": "portrait",
+    "paper_cm": [21.0, 29.7],
+    "margin_cm": 2.5,
+    "wide_table_orientation": "landscape"
+  },
+  "typography": {
+    "body_font_ascii": "Times New Roman",
+    "body_font_east_asia": "宋体",
+    "body_size_pt": 12,
+    "body_first_line_indent_pt": 24,
+    "body_line_spacing_pt": 24,
+    "chapter_title_size_pt": 14,
+    "chapter_title_line_spacing_pt": 30,
+    "section_heading_size_pt": 12,
+    "table_caption_size_pt": 12,
+    "table_cell_size_pt": 10.5,
+    "document_title_size_pt": 18
+  },
+  "tables": {
+    "style_name": "Normal Table",
+    "header_shading": false,
+    "cell_alignment": "center",
+    "header_bold": true,
+    "outer_border": "thinThickSmallGap / thickThinSmallGap",
+    "inner_border": "single"
+  },
+  "numbering": {
+    "numbered_sections": ["overview", "noise", "surface_water"],
+    "state_file": "output/debug_tables/docx_numbering_state.json",
+    "generation_order": ["overview", "noise", "surface_water"]
+  },
+  "heading_styles": {
+    "level1": ["标题 1", "标题1", "Heading 1"],
+    "level2": ["标题 2", "标题2", "Heading 2"],
+    "level3": ["标题 3", "标题3", "Heading 3"]
+  }
+}

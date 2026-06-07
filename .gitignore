@@ -4,3 +4,5 @@ __pycache__/
 input/
 output/
 runs/
+.cursor/
+eia_result*.json

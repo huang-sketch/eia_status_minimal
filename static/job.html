@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>任务详情 · 环评现状分析</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body class="page-job">
+  <header>
+    <a class="brand" href="/">
+      <div class="brand-icon" aria-hidden="true">EIA</div>
+      <div>
+        <h1>环评现状分析自动化系统</h1>
+        <p class="brand-sub">任务详情与结果预览</p>
+      </div>
+    </a>
+    <div class="header-right">
+      <a class="download-button btn-ghost" href="/">新建任务</a>
+      <div class="service-badge">127.0.0.1:8010</div>
+    </div>
+  </header>
+
+  <main>
+    <div id="notFound" class="not-found" style="display:none;">
+      <h2>任务不存在</h2>
+      <p id="notFoundMsg">无法找到该任务，可能已被删除或链接有误。</p>
+      <a class="download-button" href="/">返回新建任务</a>
+    </div>
+
+    <div id="jobContent" class="job-layout" style="display:none;">
+      <aside class="job-sidebar">
+        <div id="jobHero" class="sidebar-card job-hero">
+          <div class="job-hero-top">
+            <span id="statusPill" class="pill">等待中</span>
+          </div>
+          <h2 class="job-title" id="jobTitle">—</h2>
+          <p class="job-meta" id="jobMeta">—</p>
+          <div class="job-step-label">当前步骤</div>
+          <div class="job-step" id="currentStep">—</div>
+          <div id="jobError" class="job-error" style="display:none;"></div>
+        </div>
+
+        <div class="sidebar-card">
+          <h3 class="sidebar-heading">任务信息</h3>
+          <div class="status-grid sidebar-grid">
+            <div class="label">任务编号</div><div id="jobId" class="mono">-</div>
+            <div class="label">状态</div><div id="statusText">等待中</div>
+            <div class="label">步骤</div><div id="stepText">-</div>
+            <div class="label">结构解析</div><div id="schemaFallbackText">等待结果</div>
+            <div class="label">LLM 润色</div><div id="llmTextPolishText">未启用</div>
+            <div class="label">错误</div><div id="errorText">-</div>
+          </div>
+        </div>
+
+        <div id="sidebarDownloads" class="sidebar-card" style="display:none;">
+          <h3 class="sidebar-heading">成果下载</h3>
+          <div id="textDownloads" class="downloads sidebar-downloads"></div>
+        </div>
+
+        <div class="sidebar-card sidebar-logs-card">
+          <h3 class="sidebar-heading">运行日志</h3>
+          <pre id="logs" class="sidebar-logs"></pre>
+        </div>
+      </aside>
+
+      <div class="job-main">
+        <div id="processingBanner" class="processing-banner">
+          <strong>正在处理中</strong>
+          <span id="processingHint">完成后将自动展示监测数据与达标判定结果</span>
+        </div>
+
+        <div id="schemaReviewBanner" class="schema-review-banner" style="display:none;">
+          <strong>结构解析需人工复核</strong>
+          <ul id="schemaReviewReasons"></ul>
+        </div>
+
+        <div id="mainPlaceholder" class="main-placeholder">
+          <div class="placeholder-inner">
+            <div class="placeholder-spinner"></div>
+            <p>任务运行中，请稍候…</p>
+          </div>
+        </div>
+
+        <div id="previewSection" style="display:none;">
+          <div class="result-section">
+            <div class="result-section-header">
+              <div>
+                <div class="result-section-title">监测数据提取</div>
+                <div class="table-note">已抽取的点位、监测结果和动态因子列</div>
+              </div>
+            </div>
+            <div class="tabs" data-tab-group="monitoring">
+              <button type="button" class="tab-button active" data-target="surfaceWaterResults">地表水</button>
+              <button type="button" class="tab-button" data-target="noiseSensitiveResults">声环境敏感点</button>
+              <button type="button" class="tab-button" data-target="noiseAttenuationResults">交通噪声衰减</button>
+            </div>
+            <div id="surfaceWaterResults" class="table-card active"></div>
+            <div id="noiseSensitiveResults" class="table-card"></div>
+            <div id="noiseAttenuationResults" class="table-card"></div>
+          </div>
+
+          <div class="result-section">
+            <div class="result-section-header">
+              <div>
+                <div class="result-section-title">达标判定</div>
+                <div class="table-note">标准指数、超标量与复核提示</div>
+              </div>
+            </div>
+            <div id="noiseSummary" class="summary-grid"></div>
+            <div class="tabs" data-tab-group="compliance">
+              <button type="button" class="tab-button active" data-target="surfaceWaterCompliance">地表水</button>
+              <button type="button" class="tab-button" data-target="noiseSensitive">声环境敏感点</button>
+              <button type="button" class="tab-button" data-target="noiseAttenuation">声环境衰减</button>
+            </div>
+            <div id="surfaceWaterCompliance" class="table-card active"></div>
+            <div id="noiseSensitive" class="table-card"></div>
+            <div id="noiseAttenuation" class="table-card"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script src="/static/app.js"></script>
+  <script>
+    const jobId = window.location.pathname.match(/^\/jobs\/([^/]+)\/?$/)?.[1];
+    let timer = null;
+    let latestGroups = {};
+
+    bindTabButtons();
+
+    if (!jobId) {
+      showNotFound("链接格式不正确");
+    } else {
+      document.getElementById("jobId").textContent = jobId;
+      document.title = `任务 ${jobId} · 环评现状分析`;
+      document.getElementById("jobContent").style.display = "";
+      poll();
+      timer = setInterval(poll, 2000);
+    }
+
+    async function poll() {
+      try {
+        const [statusResponse, logResponse] = await Promise.all([
+          fetch(`/api/jobs/${jobId}`),
+          fetch(`/api/jobs/${jobId}/logs`)
+        ]);
+
+        if (statusResponse.status === 404) {
+          clearInterval(timer);
+          showNotFound("任务不存在或已被删除");
+          return;
+        }
+
+        const status = await statusResponse.json();
+        const logs = await logResponse.text();
+        latestGroups = status.result_groups || {};
+        const meta = status.project_meta || {};
+
+        document.getElementById("jobTitle").textContent = meta.report_name || "分析任务";
+        document.getElementById("jobMeta").textContent = [
+          meta.admin_division,
+          meta.created_at ? `创建于 ${meta.created_at}` : null
+        ].filter(Boolean).join(" · ");
+
+        updateHero(status);
+        document.getElementById("statusText").textContent = statusLabel(status.status);
+        document.getElementById("stepText").textContent = status.current_step || "-";
+        document.getElementById("errorText").textContent = status.error || "-";
+        renderLlmTextPolishStatus(status.llm_text_polish || {});
+        renderSchemaFallbackStatus(status.schema_fallback || {});
+        document.getElementById("logs").textContent = logs || "暂无日志";
+
+        const isRunning = status.status === "pending" || status.status === "running";
+        document.getElementById("processingBanner").classList.toggle("visible", isRunning);
+        document.getElementById("mainPlaceholder").classList.toggle("visible", isRunning);
+
+        if (status.status === "success") {
+          clearInterval(timer);
+          document.getElementById("mainPlaceholder").classList.remove("visible");
+          document.getElementById("previewSection").style.display = "";
+          document.getElementById("sidebarDownloads").style.display = "";
+          await loadPreview();
+          renderTextDownloads(latestGroups, jobId);
+        } else if (status.status === "failed") {
+          clearInterval(timer);
+          document.getElementById("mainPlaceholder").classList.remove("visible");
+        }
+      } catch (error) {
+        console.error(error);
+        if (error.message === "Failed to fetch") {
+          document.getElementById("currentStep").textContent =
+            "无法连接服务器，请确认 python web_app.py 正在运行";
+        }
+      }
+    }
+
+    function updateHero(status) {
+      const hero = document.getElementById("jobHero");
+      const pill = document.getElementById("statusPill");
+      const step = document.getElementById("currentStep");
+      const errorEl = document.getElementById("jobError");
+
+      pill.textContent = statusLabel(status.status);
+      pill.className = `pill ${status.status || ""}`;
+      step.textContent = status.current_step || "—";
+
+      hero.className = "sidebar-card job-hero";
+      if (status.status) hero.classList.add(status.status);
+
+      if (status.error) {
+        errorEl.textContent = status.error;
+        errorEl.style.display = "";
+      } else {
+        errorEl.style.display = "none";
+      }
+    }
+
+    async function loadPreview() {
+      const response = await fetch(`/api/jobs/${jobId}/preview`);
+      const preview = await response.json();
+
+      renderTable("surfaceWaterResults", preview.monitoring_extraction.surface_water_results, "monitoring", jobId);
+      renderTable("noiseSensitiveResults", preview.monitoring_extraction.noise_sensitive_results, "monitoring", jobId);
+      renderTable("noiseAttenuationResults", preview.monitoring_extraction.noise_attenuation_results, "monitoring", jobId);
+      renderTable("surfaceWaterCompliance", preview.compliance.surface_water_compliance, "surface_water_compliance", jobId);
+      renderTable("noiseSensitive", preview.compliance.noise_sensitive, "noise_compliance", jobId);
+      renderTable("noiseAttenuation", preview.compliance.noise_attenuation, "noise_compliance", jobId);
+      renderNoiseSummary(preview.compliance.noise_summary || {});
+      renderLlmTextPolishStatus(preview.llm_text_polish || {});
+      renderSchemaFallbackStatus(preview.schema_fallback || {});
+    }
+
+    function showNotFound(message) {
+      document.getElementById("jobContent").style.display = "none";
+      document.getElementById("notFound").style.display = "";
+      document.getElementById("notFoundMsg").textContent = message;
+    }
+  </script>
+</body>
+</html>

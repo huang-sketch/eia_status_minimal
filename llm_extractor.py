@@ -1,15 +1,20 @@
 import json
-import http.client
 import os
 import re
-import ssl
-import time
-import urllib.error
-import urllib.request
 from typing import Any, Dict, Iterable, List, Optional
 
-import certifi
-
+from llm_client import (
+    DEFAULT_ENDPOINT,
+    DEFAULT_MODEL,
+    LLM_MAX_RETRIES,
+    LLM_RETRY_DELAY_SECONDS,
+    LLM_TIMEOUT_SECONDS,
+    SSL_CONTEXT,
+    LlmProfile,
+    chat_completion_json_array,
+    llm_enabled,
+    parse_json_array,
+)
 from models import ExtractedRecord, MonitorType
 
 
@@ -27,13 +32,6 @@ FIELDS = [
     "evidence",
     "confidence",
 ]
-
-DEFAULT_ENDPOINT = "https://api.openai.com/v1/chat/completions"
-DEFAULT_MODEL = "gpt-4o-mini"
-LLM_TIMEOUT_SECONDS = int(os.getenv("EIA_LLM_TIMEOUT_SECONDS", "25"))
-LLM_MAX_RETRIES = int(os.getenv("EIA_LLM_MAX_RETRIES", "1"))
-LLM_RETRY_DELAY_SECONDS = 2
-SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 NUMBER_RE = re.compile(r"[<≤>=]?\d+(?:\.\d+)?(?:\s*[-~–]\s*\d+(?:\.\d+)?)?")
 UNIT_RE = re.compile(
@@ -94,10 +92,6 @@ def extract_records_from_chunk(
     return normalized
 
 
-def llm_enabled() -> bool:
-    return bool(os.getenv("EIA_LLM_API_KEY")) and os.getenv("EIA_LLM_DISABLE") != "1"
-
-
 def detect_result_table_type(text: str) -> Optional[str]:
     """
     Backward-compatible hint only.
@@ -119,14 +113,9 @@ def call_llm(
     logger: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     prompt = build_prompt(chunk_text)
-    payload = {
-        "model": (chunk or {}).get("llm_model") or os.getenv("EIA_LLM_MODEL", DEFAULT_MODEL),
-        "temperature": 0,
-        "max_tokens": int(
-            (chunk or {}).get("llm_max_tokens")
-            or os.getenv("EIA_LLM_MAX_TOKENS", "2048")
-        ),
-        "messages": [
+    chunk_data = chunk or {}
+    return chat_completion_json_array(
+        [
             {
                 "role": "system",
                 "content": (
@@ -136,72 +125,13 @@ def call_llm(
             },
             {"role": "user", "content": prompt},
         ],
-    }
-
-    endpoint = os.getenv("EIA_LLM_ENDPOINT", DEFAULT_ENDPOINT)
-
-    for attempt in range(1, LLM_MAX_RETRIES + 1):
-        started = time.time()
-        request = urllib.request.Request(
-            endpoint,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {os.getenv('EIA_LLM_API_KEY')}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            print(f"LLM call attempt {attempt}/{LLM_MAX_RETRIES}", flush=True)
-            with urllib.request.urlopen(
-                request,
-                timeout=LLM_TIMEOUT_SECONDS,
-                context=SSL_CONTEXT,
-            ) as response:
-                data = json.loads(response.read().decode("utf-8"))
-
-            content = data["choices"][0]["message"]["content"]
-            records = parse_json_records(content)
-            if logger:
-                logger.log_llm_call(
-                    {
-                        "chunk_id": (chunk or {}).get("chunk_id"),
-                        "attempt": attempt,
-                        "model": payload["model"],
-                        "success": True,
-                        "latency_ms": int((time.time() - started) * 1000),
-                        "record_count": len(records),
-                        "error": None,
-                    }
-                )
-            print("LLM call succeeded", flush=True)
-            return records
-        except (
-            urllib.error.URLError,
-            http.client.RemoteDisconnected,
-            OSError,
-            TimeoutError,
-            json.JSONDecodeError,
-            KeyError,
-            ValueError,
-        ) as exc:
-            if logger:
-                logger.log_llm_call(
-                    {
-                        "chunk_id": (chunk or {}).get("chunk_id"),
-                        "attempt": attempt,
-                        "model": payload["model"],
-                        "success": False,
-                        "latency_ms": int((time.time() - started) * 1000),
-                        "record_count": 0,
-                        "error": str(exc),
-                    }
-                )
-            print(f"LLM call failed on attempt {attempt}/{LLM_MAX_RETRIES}: {exc}", flush=True)
-            if attempt < LLM_MAX_RETRIES:
-                time.sleep(LLM_RETRY_DELAY_SECONDS * attempt)
-
-    raise RuntimeError("LLM call failed after all retries")
+        profile=LlmProfile.extraction,
+        model=chunk_data.get("llm_model"),
+        max_tokens=chunk_data.get("llm_max_tokens"),
+        label="llm_extract",
+        logger=logger,
+        logger_context={"chunk_id": chunk_data.get("chunk_id")},
+    )
 
 
 def build_prompt(chunk_text: str) -> str:
@@ -235,19 +165,7 @@ def build_prompt(chunk_text: str) -> str:
 
 
 def parse_json_records(content: str) -> List[Dict[str, Any]]:
-    content = content.strip()
-    if content.startswith("```"):
-        content = re.sub(r"^```(?:json)?", "", content).strip()
-        content = re.sub(r"```$", "", content).strip()
-
-    parsed = json.loads(content)
-    if isinstance(parsed, dict):
-        if parsed.get("contains_monitoring_data") is False:
-            return []
-        parsed = parsed.get("records", [])
-    if not isinstance(parsed, list):
-        raise ValueError("LLM response must be a JSON array or an object with records.")
-    return [item for item in parsed if isinstance(item, dict)]
+    return parse_json_array(content)
 
 
 def fallback_extract(text: str) -> List[Dict[str, Any]]:

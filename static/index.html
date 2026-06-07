@@ -3,671 +3,170 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>环评现状分析自动化系统</title>
-  <style>
-    :root {
-      color-scheme: light;
-      --bg: #f5f7fa;
-      --panel: #ffffff;
-      --line: #d9dee7;
-      --line-strong: #c5cedc;
-      --text: #172033;
-      --muted: #637083;
-      --soft: #f8fafc;
-      --accent: #2468d8;
-      --accent-dark: #174ea6;
-      --ok: #18794e;
-      --bad: #b42318;
-      --warn: #98690c;
-      --warn-bg: #fff8e6;
-      --bad-bg: #fff1f0;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font-family: "Microsoft YaHei", "SimSun", Arial, sans-serif;
-      font-size: 14px;
-    }
-    header {
-      background: var(--panel);
-      border-bottom: 1px solid var(--line);
-      padding: 16px 28px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 18px;
-    }
-    h1 {
-      margin: 0;
-      font-size: 22px;
-      font-weight: 700;
-    }
-    .service-hint {
-      color: var(--muted);
-      font-size: 13px;
-    }
-    main {
-      display: grid;
-      grid-template-columns: minmax(320px, 420px) minmax(640px, 1fr);
-      gap: 18px;
-      padding: 18px 28px 28px;
-    }
-    section, .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 18px;
-    }
-    h2 {
-      margin: 0 0 14px;
-      font-size: 17px;
-    }
-    h3 {
-      margin: 18px 0 10px;
-      font-size: 15px;
-    }
-    label {
-      display: block;
-      margin: 12px 0 6px;
-      color: var(--muted);
-    }
-    input[type="text"], input[type="file"] {
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #fff;
-      color: var(--text);
-      padding: 9px 10px;
-      font: inherit;
-    }
-    .checks {
-      display: grid;
-      gap: 10px;
-      margin-top: 10px;
-    }
-    .check {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      color: var(--text);
-    }
-    button, .download-button {
-      border: 0;
-      border-radius: 6px;
-      background: var(--accent);
-      color: #fff;
-      padding: 9px 12px;
-      font: inherit;
-      font-weight: 700;
-      cursor: pointer;
-      text-decoration: none;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 6px;
-    }
-    button:hover, .download-button:hover { background: var(--accent-dark); }
-    button:disabled {
-      background: #9aa8bd;
-      cursor: not-allowed;
-    }
-    #submitBtn {
-      width: 100%;
-      margin-top: 18px;
-      padding: 11px 12px;
-    }
-    .status-bar {
-      display: none;
-      margin: 0 28px;
-      padding: 10px 14px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel);
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-    }
-    .status-bar.visible { display: flex; }
-    .status-bar.failed {
-      border-color: #f0b8b2;
-      background: var(--bad-bg);
-    }
-    .pill {
-      display: inline-block;
-      min-width: 72px;
-      text-align: center;
-      border-radius: 999px;
-      padding: 3px 10px;
-      background: #e9eef7;
-    }
-    .success { color: var(--ok); }
-    .failed { color: var(--bad); }
-    .result-shell {
-      display: grid;
-      gap: 14px;
-    }
-    .empty-state {
-      border: 1px dashed var(--line-strong);
-      border-radius: 8px;
-      padding: 30px;
-      text-align: center;
-      color: var(--muted);
-      background: var(--soft);
-    }
-    .result-section {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      overflow: hidden;
-      background: #fff;
-    }
-    .result-section-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      padding: 12px 14px;
-      border-bottom: 1px solid var(--line);
-      background: var(--soft);
-    }
-    .result-section-title {
-      font-weight: 700;
-      font-size: 15px;
-    }
-    .tabs {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      padding: 12px 14px 0;
-    }
-    .tab-button {
-      width: auto;
-      margin: 0;
-      background: #eef2f8;
-      color: var(--text);
-      font-weight: 600;
-    }
-    .tab-button.active {
-      background: var(--accent);
-      color: #fff;
-    }
-    .table-card {
-      padding: 14px;
-      display: none;
-    }
-    .table-card.active { display: block; }
-    .table-toolbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 10px;
-    }
-    .table-title {
-      font-weight: 700;
-    }
-    .table-note {
-      color: var(--muted);
-      font-size: 13px;
-      margin: 4px 0 0;
-    }
-    .table-wrap {
-      overflow-x: auto;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #fff;
-    }
-    table {
-      border-collapse: collapse;
-      min-width: 100%;
-      white-space: nowrap;
-      font-size: 13px;
-    }
-    th, td {
-      border-bottom: 1px solid var(--line);
-      border-right: 1px solid var(--line);
-      padding: 7px 9px;
-      text-align: left;
-      vertical-align: top;
-    }
-    th {
-      position: sticky;
-      top: 0;
-      background: #eef2f8;
-      z-index: 1;
-      font-weight: 700;
-    }
-    tr.review-row td { background: var(--warn-bg); }
-    td.exceed-cell {
-      color: var(--bad);
-      background: var(--bad-bg);
-      font-weight: 700;
-    }
-    .summary-grid {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 10px;
-      padding: 14px;
-    }
-    .summary-card {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 12px;
-      background: var(--soft);
-    }
-    .summary-card strong {
-      display: block;
-      font-size: 18px;
-      margin-top: 4px;
-    }
-    .downloads {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      padding: 14px;
-    }
-    .download-button.secondary {
-      background: #eef2f8;
-      color: var(--accent-dark);
-    }
-    .download-button.secondary:hover {
-      background: #dfe7f4;
-    }
-    details {
-      margin-top: 14px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel);
-    }
-    summary {
-      cursor: pointer;
-      padding: 12px 14px;
-      font-weight: 700;
-    }
-    .status-grid {
-      display: grid;
-      grid-template-columns: 120px 1fr;
-      gap: 8px 12px;
-      padding: 0 14px 14px;
-    }
-    .label { color: var(--muted); }
-    .llm-state {
-      font-weight: 700;
-    }
-    .llm-state.success { color: var(--ok); }
-    .llm-state.failed { color: var(--bad); }
-    .llm-state.pending { color: var(--warn); }
-    .llm-state.not_enabled,
-    .llm-state.unknown { color: var(--muted); }
-    pre {
-      max-height: 260px;
-      overflow: auto;
-      margin: 0 14px 14px;
-      padding: 12px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #fbfcfe;
-      white-space: pre-wrap;
-      line-height: 1.55;
-    }
-    @media (max-width: 1080px) {
-      main { grid-template-columns: 1fr; }
-      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    }
-    @media (max-width: 640px) {
-      header { align-items: flex-start; flex-direction: column; }
-      main { padding: 14px; }
-      .status-bar { margin: 0 14px; }
-      .summary-grid { grid-template-columns: 1fr; }
-      .result-section-header, .table-toolbar { align-items: flex-start; flex-direction: column; }
-    }
-  </style>
+  <title>新建任务 · 环评现状分析</title>
+  <link rel="stylesheet" href="/static/styles.css" />
 </head>
-<body>
+<body class="page-input">
   <header>
-    <h1>环评现状分析自动化系统</h1>
-    <div class="service-hint">本地服务：127.0.0.1:8001</div>
+    <a class="brand" href="/">
+      <div class="brand-icon" aria-hidden="true">EIA</div>
+      <div>
+        <h1>环评现状分析自动化系统</h1>
+        <p class="brand-sub">监测数据提取 · 达标判定 · 章节生成</p>
+      </div>
+    </a>
+    <div class="header-right">
+      <div class="service-badge">127.0.0.1:8010</div>
+    </div>
   </header>
 
-  <div id="statusBar" class="status-bar">
-    <div><span id="status" class="pill">等待中</span> <span id="step">尚未创建任务</span></div>
-    <div id="error"></div>
-  </div>
-
   <main>
-    <section>
-      <h2>输入信息</h2>
-      <form id="jobForm">
-        <label for="reportName">环评报告名称</label>
-        <input id="reportName" name="report_name" type="text" required placeholder="例如：台儿庄高速环境影响报告书" />
-
-        <label for="adminDivision">工程所在行政区划</label>
-        <input id="adminDivision" name="admin_division" type="text" required placeholder="例如：山东省枣庄市台儿庄区" />
-
-        <label for="monitoringReport">监测报告</label>
-        <input id="monitoringReport" name="monitoring_report" type="file" accept=".docx" required />
-
-        <label for="monitoringPlan">监测方案</label>
-        <input id="monitoringPlan" name="monitoring_plan" type="file" accept=".docx" required />
-
-        <h3>生成内容</h3>
-        <div class="checks">
-          <label class="check"><input name="run_surface_water" type="checkbox" checked /> 地表水现状调查与评价</label>
-          <label class="check"><input name="run_noise" type="checkbox" checked /> 声环境现状调查与评价</label>
-          <label class="check"><input name="enable_llm_text_polish" type="checkbox" /> 启用 LLM 文本润色</label>
-        </div>
-        <button id="submitBtn" type="submit">开始生成</button>
-      </form>
-
-      <details id="runDetails">
-        <summary>运行详情</summary>
-        <div class="status-grid">
-          <div class="label">任务编号</div><div id="jobId">-</div>
-          <div class="label">当前状态</div><div id="statusText">等待中</div>
-          <div class="label">当前步骤</div><div id="stepText">-</div>
-          <div class="label">错误信息</div><div id="errorText">-</div>
-          <div class="label">LLM 文本润色</div><div id="llmTextPolishText">未启用</div>
-        </div>
-        <pre id="logs"></pre>
-      </details>
-    </section>
-
-    <div class="result-shell">
-      <section>
-        <h2>结果预览</h2>
-        <div id="emptyState" class="empty-state">上传监测报告和监测方案后，系统将在这里展示监测数据提取和达标判定结果。</div>
-
-        <div id="previewRoot" style="display:none;">
-          <div class="result-section">
-            <div class="result-section-header">
-              <div>
-                <div class="result-section-title">监测数据提取</div>
-                <div class="table-note">直接展示已抽取的点位、监测结果和动态因子列。</div>
-              </div>
-            </div>
-            <div class="tabs" data-tab-group="monitoring">
-              <button type="button" class="tab-button active" data-target="surfaceWaterResults">地表水监测结果</button>
-              <button type="button" class="tab-button" data-target="noiseSensitiveResults">声环境敏感点监测结果</button>
-              <button type="button" class="tab-button" data-target="noiseAttenuationResults">交通噪声衰减断面监测结果</button>
-            </div>
-            <div id="surfaceWaterResults" class="table-card active"></div>
-            <div id="noiseSensitiveResults" class="table-card"></div>
-            <div id="noiseAttenuationResults" class="table-card"></div>
-          </div>
-
-          <div class="result-section">
-            <div class="result-section-header">
-              <div>
-                <div class="result-section-title">达标判定</div>
-                <div class="table-note">展示标准指数、声环境超标量和复核提示。</div>
-              </div>
-            </div>
-            <div id="noiseSummary" class="summary-grid"></div>
-            <div class="tabs" data-tab-group="compliance">
-              <button type="button" class="tab-button active" data-target="surfaceWaterCompliance">地表水达标判定</button>
-              <button type="button" class="tab-button" data-target="noiseSensitive">声环境敏感点达标判定</button>
-              <button type="button" class="tab-button" data-target="noiseAttenuation">声环境衰减断面达标判定</button>
-            </div>
-            <div id="surfaceWaterCompliance" class="table-card active"></div>
-            <div id="noiseSensitive" class="table-card"></div>
-            <div id="noiseAttenuation" class="table-card"></div>
-          </div>
-
-          <div class="result-section">
-            <div class="result-section-header">
-              <div>
-                <div class="result-section-title">文本输出</div>
-                <div class="table-note">Word 章节仍以下载为主，完整成果包包含 JSON、Word 和 debug 文件。</div>
-              </div>
-            </div>
-            <div id="textDownloads" class="downloads"></div>
+    <div class="input-layout">
+      <section class="input-form-panel">
+        <div class="section-header">
+          <div class="section-icon" aria-hidden="true">+</div>
+          <div>
+            <h2>新建分析任务</h2>
+            <p class="section-desc">填写项目信息、上传 Word 文件并选择生成模块</p>
           </div>
         </div>
+
+        <form id="jobForm">
+          <div class="form-row">
+            <div class="field">
+              <label class="field-label" for="reportName">环评报告名称</label>
+              <input id="reportName" name="report_name" type="text" required placeholder="例如：台儿庄高速环境影响报告书" />
+            </div>
+            <div class="field">
+              <label class="field-label" for="adminDivision">工程所在行政区划</label>
+              <input id="adminDivision" name="admin_division" type="text" required placeholder="例如：山东省枣庄市台儿庄区" />
+            </div>
+          </div>
+
+          <div class="form-files">
+            <div class="field">
+              <label class="field-label">监测报告</label>
+              <div class="file-field">
+                <input id="monitoringReport" name="monitoring_report" type="file" accept=".docx" required />
+                <div class="file-drop">
+                  <div class="file-drop-icon">DOC</div>
+                  <div class="file-drop-text">
+                    <div class="file-drop-name" id="reportFileName">选择 .docx 文件</div>
+                    <div class="file-drop-hint">监测报告</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="field">
+              <label class="field-label">监测方案</label>
+              <div class="file-field">
+                <input id="monitoringPlan" name="monitoring_plan" type="file" accept=".docx" required />
+                <div class="file-drop">
+                  <div class="file-drop-icon">DOC</div>
+                  <div class="file-drop-text">
+                    <div class="file-drop-name" id="planFileName">选择 .docx 文件</div>
+                    <div class="file-drop-hint">监测方案</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <h3>生成内容</h3>
+          <div class="checks checks-grid">
+            <label class="option-card">
+              <input name="run_surface_water" type="checkbox" checked />
+              <div class="option-body">
+                <div class="option-title">地表水现状调查与评价</div>
+                <div class="option-desc">监测结果提取、达标判定、Word 章节</div>
+              </div>
+            </label>
+            <label class="option-card">
+              <input name="run_noise" type="checkbox" checked />
+              <div class="option-body">
+                <div class="option-title">声环境现状调查与评价</div>
+                <div class="option-desc">敏感点与交通噪声衰减断面分析</div>
+              </div>
+            </label>
+            <label class="option-card">
+              <input name="enable_llm_extraction" type="checkbox" checked />
+              <div class="option-body">
+                <div class="option-title">智能结构兜底</div>
+                <div class="option-desc">规则无法识别表头时调用大模型解释结构，不修改监测数值</div>
+              </div>
+            </label>
+            <label class="option-card">
+              <input name="enable_llm_text_polish" type="checkbox" />
+              <div class="option-body">
+                <div class="option-title">LLM 文本润色</div>
+                <div class="option-desc">对 Word 章节文字进行润色优化</div>
+              </div>
+            </label>
+          </div>
+
+          <div id="formError" class="form-error"></div>
+          <button id="submitBtn" type="submit">开始生成</button>
+        </form>
       </section>
+
+      <aside class="input-aside panel">
+        <h3 class="aside-title">处理流程</h3>
+        <ol class="steps-list">
+          <li><strong>上传文件</strong><span>监测报告与监测方案（.docx）</span></li>
+          <li><strong>数据抽取</strong><span>解析表格，提取监测记录</span></li>
+          <li><strong>达标判定</strong><span>对照标准计算指数与超标项</span></li>
+          <li><strong>章节生成</strong><span>输出 Word 章节与完整成果包</span></li>
+        </ol>
+        <div class="aside-note">
+          <strong>文件要求</strong>
+          <p>仅支持 .docx 格式。监测报告应包含检测结果表，监测方案应包含点位与评价标准信息。</p>
+        </div>
+        <div class="aside-note">
+          <strong>提交后</strong>
+          <p>系统将跳转至任务详情页，可实时查看进度、预览表格并下载成果。</p>
+        </div>
+      </aside>
     </div>
   </main>
 
+  <script src="/static/app.js"></script>
   <script>
     const form = document.getElementById("jobForm");
     const submitBtn = document.getElementById("submitBtn");
-    let activeJobId = null;
-    let timer = null;
-    let latestGroups = {};
+    const formError = document.getElementById("formError");
+
+    bindFileInput("monitoringReport", "reportFileName");
+    bindFileInput("monitoringPlan", "planFileName");
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
+      formError.classList.remove("visible");
+      formError.textContent = "";
+
       const data = new FormData(form);
       data.set("run_surface_water", form.run_surface_water.checked ? "true" : "false");
       data.set("run_noise", form.run_noise.checked ? "true" : "false");
+      data.set("enable_llm_extraction", form.enable_llm_extraction.checked ? "true" : "false");
       data.set("enable_llm_text_polish", form.enable_llm_text_polish.checked ? "true" : "false");
 
       submitBtn.disabled = true;
-      setText("logs", "正在上传文件并创建任务...");
-      setStatus("pending", "正在创建任务", "");
+      submitBtn.textContent = "正在上传…";
+
       try {
         const response = await fetch("/api/jobs", { method: "POST", body: data });
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.detail || "任务创建失败");
-        activeJobId = payload.job_id;
-        setText("jobId", activeJobId);
-        poll();
-        timer = setInterval(poll, 2000);
+        window.location.href = `/jobs/${payload.job_id}`;
       } catch (error) {
-        setStatus("failed", "任务创建失败", error.message);
-        setText("errorText", error.message);
+        const msg = error.message === "Failed to fetch"
+          ? "无法连接服务器，请确认已在项目目录运行 python web_app.py"
+          : error.message;
+        formError.textContent = msg;
+        formError.classList.add("visible");
         submitBtn.disabled = false;
-        document.getElementById("runDetails").open = true;
+        submitBtn.textContent = "开始生成";
       }
     });
-
-    async function poll() {
-      if (!activeJobId) return;
-      const [statusResponse, logResponse] = await Promise.all([
-        fetch(`/api/jobs/${activeJobId}`),
-        fetch(`/api/jobs/${activeJobId}/logs`)
-      ]);
-      const status = await statusResponse.json();
-      const logs = await logResponse.text();
-      latestGroups = status.result_groups || {};
-      setStatus(status.status, status.current_step || "-", status.error || "");
-      setText("jobId", activeJobId);
-      setText("statusText", statusLabel(status.status));
-      setText("stepText", status.current_step || "-");
-      setText("errorText", status.error || "-");
-      renderLlmTextPolishStatus(status.llm_text_polish || {});
-      setText("logs", logs || "");
-
-      if (status.status === "success" || status.status === "failed") {
-        clearInterval(timer);
-        submitBtn.disabled = false;
-        if (status.status === "success") {
-          await loadPreview();
-          renderTextDownloads(latestGroups);
-        } else {
-          document.getElementById("runDetails").open = true;
-        }
-      }
-    }
-
-    async function loadPreview() {
-      const response = await fetch(`/api/jobs/${activeJobId}/preview`);
-      const preview = await response.json();
-      document.getElementById("emptyState").style.display = "none";
-      document.getElementById("previewRoot").style.display = "";
-
-      renderTable("surfaceWaterResults", preview.monitoring_extraction.surface_water_results, "monitoring");
-      renderTable("noiseSensitiveResults", preview.monitoring_extraction.noise_sensitive_results, "monitoring");
-      renderTable("noiseAttenuationResults", preview.monitoring_extraction.noise_attenuation_results, "monitoring");
-      renderTable("surfaceWaterCompliance", preview.compliance.surface_water_compliance, "surface_water_compliance");
-      renderTable("noiseSensitive", preview.compliance.noise_sensitive, "noise_compliance");
-      renderTable("noiseAttenuation", preview.compliance.noise_attenuation, "noise_compliance");
-      renderNoiseSummary(preview.compliance.noise_summary || {});
-      renderLlmTextPolishStatus(preview.llm_text_polish || {});
-    }
-
-    function renderLlmTextPolishStatus(llmStatus) {
-      const target = document.getElementById("llmTextPolishText");
-      const state = llmStatus.state || "unknown";
-      const warnings = Array.isArray(llmStatus.warnings) ? llmStatus.warnings.filter(Boolean) : [];
-      const detail = warnings.length ? `：${warnings.join("；")}` : "";
-      target.className = `llm-state ${state}`;
-      target.textContent = `${llmStatus.label || "暂无结果"}${detail}`;
-    }
-
-    function renderTable(containerId, table, tableType) {
-      const container = document.getElementById(containerId);
-      const headers = table.headers || [];
-      const rows = table.rows || [];
-      const previewRows = rows.slice(0, 50);
-      const sourcePath = table.source_path || "";
-      const title = table.title || "暂无数据";
-
-      if (!table.exists || !rows.length) {
-        container.innerHTML = `<div class="empty-state">暂无可展示数据</div>`;
-        return;
-      }
-
-      const downloadHref = `/api/jobs/${activeJobId}/download/${encodeURI(sourcePath)}`;
-      const note = rows.length > 50 ? `仅预览前50行，共${rows.length}行；可下载完整 JSON。` : `共${rows.length}行。`;
-      const head = headers.map((header) => `<th>${escapeHtml(header)}</th>`).join("");
-      const body = previewRows.map((row) => {
-        const review = row.needs_review === true || Boolean(row.warning);
-        const cells = headers.map((header) => {
-          const value = row[header] ?? "";
-          const exceed = isExceedCell(header, value, tableType);
-          return `<td class="${exceed ? "exceed-cell" : ""}">${escapeHtml(formatValue(value))}</td>`;
-        }).join("");
-        return `<tr class="${review ? "review-row" : ""}">${cells}</tr>`;
-      }).join("");
-
-      container.innerHTML = `
-        <div class="table-toolbar">
-          <div>
-            <div class="table-title">${escapeHtml(title)}</div>
-            <div class="table-note">${escapeHtml(note)}</div>
-          </div>
-          <a class="download-button secondary" href="${downloadHref}" target="_blank">下载 JSON</a>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr>${head}</tr></thead>
-            <tbody>${body}</tbody>
-          </table>
-        </div>
-      `;
-    }
-
-    function renderNoiseSummary(summary) {
-      const sensitive = summary.sensitive || {};
-      const attenuation = summary.attenuation || {};
-      const cards = [
-        ["敏感点总数", sensitive.total_count ?? "-"],
-        ["敏感点超标", sensitive.exceed_count ?? "-"],
-        ["衰减断面总数", attenuation.total_count ?? "-"],
-        ["衰减断面超标", attenuation.exceed_count ?? "-"]
-      ];
-      document.getElementById("noiseSummary").innerHTML = cards.map(([label, value]) => `
-        <div class="summary-card">
-          <span>${escapeHtml(label)}</span>
-          <strong>${escapeHtml(String(value))}</strong>
-        </div>
-      `).join("");
-    }
-
-    function renderTextDownloads(groups) {
-      const container = document.getElementById("textDownloads");
-      const files = groups.text_output?.files || [];
-      container.innerHTML = "";
-      if (!files.length) {
-        container.innerHTML = `<div class="empty-state">暂无文本输出文件</div>`;
-        return;
-      }
-      files.forEach((file) => {
-        const link = document.createElement("a");
-        link.className = "download-button";
-        link.href = `/api/jobs/${activeJobId}/download/${encodeURI(file.path)}`;
-        link.textContent = downloadLabel(file.name);
-        link.target = "_blank";
-        container.appendChild(link);
-      });
-    }
-
-    document.addEventListener("click", (event) => {
-      const button = event.target.closest(".tab-button");
-      if (!button) return;
-      const group = button.parentElement;
-      const section = group.parentElement;
-      group.querySelectorAll(".tab-button").forEach((item) => item.classList.remove("active"));
-      section.querySelectorAll(".table-card").forEach((item) => item.classList.remove("active"));
-      button.classList.add("active");
-      document.getElementById(button.dataset.target).classList.add("active");
-    });
-
-    function setStatus(value, step, error) {
-      const bar = document.getElementById("statusBar");
-      const status = document.getElementById("status");
-      status.textContent = statusLabel(value);
-      status.className = `pill ${value || ""}`;
-      setText("step", step || "-");
-      setText("error", error || "");
-      bar.classList.toggle("visible", value === "running" || value === "failed" || value === "pending");
-      bar.classList.toggle("failed", value === "failed");
-    }
-
-    function statusLabel(value) {
-      return {
-        pending: "等待中",
-        running: "运行中",
-        success: "成功",
-        failed: "失败"
-      }[value] || value || "等待中";
-    }
-
-    function isExceedCell(header, value, tableType) {
-      const normalizedHeader = String(header).toLowerCase();
-      const number = Number(value);
-      if (!Number.isFinite(number)) return false;
-      if (tableType === "noise_compliance" && normalizedHeader.includes("exceed")) {
-        return number > 0;
-      }
-      if (tableType === "surface_water_compliance" && isSurfaceWaterFactorColumn(header)) {
-        return number > 1;
-      }
-      return false;
-    }
-
-    function isSurfaceWaterFactorColumn(header) {
-      const excluded = new Set(["编号", "监测时间", "point_code", "needs_review", "warning"]);
-      return !excluded.has(String(header));
-    }
-
-    function formatValue(value) {
-      if (Array.isArray(value)) return value.join("、");
-      if (value && typeof value === "object") return JSON.stringify(value);
-      return value;
-    }
-
-    function downloadLabel(name) {
-      return {
-        "surface_water_section.docx": "下载地表水章节",
-        "noise_section.docx": "下载声环境章节",
-        "eia_outputs.zip": "下载完整成果包"
-      }[name] || name;
-    }
-
-    function escapeHtml(value) {
-      return String(value)
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#039;");
-    }
-
-    function setText(id, text) {
-      document.getElementById(id).textContent = text;
-    }
   </script>
 </body>
 </html>

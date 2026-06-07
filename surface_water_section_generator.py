@@ -15,20 +15,30 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from docx import Document
-from docx.enum.section import WD_ORIENT
-from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
-from docx.shared import Cm, Pt, RGBColor
 
-from llm_extractor import (
-    DEFAULT_ENDPOINT,
-    LLM_MAX_RETRIES,
-    LLM_RETRY_DELAY_SECONDS,
-    LLM_TIMEOUT_SECONDS,
-    SSL_CONTEXT,
+from docx_layout import (
+    HEADER_FILL,
+    TABLE_STYLE,
+    add_body_paragraph,
+    add_caption,
+    add_chapter_title,
+    add_formula,
+    add_landscape_section,
+    add_level3_heading,
+    add_portrait_section,
+    add_section_heading,
+    add_table,
+    create_section_document,
+    finalize_section_document,
+    finalize_table,
+    setup_document,
+    set_cell_text_style,
+    shade_cell,
+    table_needs_landscape,
 )
+from docx_numbering import DocxNumbering, load_numbering
+from llm_client import LlmProfile, SSL_CONTEXT, build_rule_text_fallback_validation, chat_completion_json_object_with_recovery
+from text_polish_utils import build_text_polish_prompt, load_text_polish_guidance
 
 load_dotenv()
 
@@ -74,6 +84,10 @@ ADMIN_LEVEL_WEIGHTS = {
     "unknown": 0,
 }
 
+SURFACE_TABLE_MONITOR_POINTS = "surface_monitor_points"
+SURFACE_TABLE_MONITOR_RESULTS = "surface_monitor_results"
+SURFACE_TABLE_COMPLIANCE = "surface_compliance"
+
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -106,6 +120,10 @@ def main() -> None:
     evaluated_factors = detect_evaluated_factors(surface_results)
     table3 = build_compliance_table(surface_results, standard_config, evaluated_factors)
 
+    numbering = load_numbering(OUTPUT_DIR)
+    numbering.begin_section("surface_water", "地表水环境现状调查与评价")
+    register_surface_tables(numbering, table1, table2, table3)
+
     write_json(DEBUG_DIR / "surface_water_monitor_points_table.json", table1)
     write_json(DEBUG_DIR / "surface_water_monitor_results_table.json", table2)
     write_json(DEBUG_DIR / "surface_water_compliance_table.json", table3)
@@ -113,7 +131,7 @@ def main() -> None:
     project_meta = read_project_meta()
     local_status = build_local_water_status(project_meta.get("admin_division", ""))
     conclusion = build_conclusion(surface_results)
-    rule_texts = build_rule_texts(table1, table2, factor_list, surface_results, conclusion)
+    rule_texts = build_rule_texts(table1, table2, factor_list, surface_results, conclusion, numbering)
     rule_texts["local_status_text"] = local_status.get("text", "")
     write_json(DEBUG_DIR / "surface_water_local_status.json", local_status)
     texts = polish_surface_water_text_with_llm(
@@ -124,9 +142,12 @@ def main() -> None:
         factor_list,
         evaluated_factors,
         surface_results,
+        numbering,
     )
-    doc = build_docx(table1, table2, table3, factor_list, evaluated_factors, texts)
+    doc = build_docx(table1, table2, table3, factor_list, evaluated_factors, texts, numbering)
+    finalize_section_document(doc)
     doc.save(SECTION_PATH)
+    write_json(DEBUG_DIR / "surface_water_section_texts.json", texts)
     print(f"generated: {SECTION_PATH}")
     print(f"detected_factors: {len(factor_list)}")
     print(f"table1 rows: {len(table1['rows'])}")
@@ -226,7 +247,7 @@ def build_monitor_points_table(
             {
                 "序号": point_code,
                 "河流名称": config.get("river_name") or parsed.get("river_name") or "-",
-                "中心桩号": evidence.get("中心桩号") or parsed.get("center_station") or "-",
+                "中心桩号": monitor_center_station(evidence, parsed),
                 "取样断面": evidence.get("取样断面") or parsed.get("sampling_section") or "-",
                 "取样频次": evidence.get("取样频次") or infer_frequency(dates),
                 "监测因子": "、".join(factor_list),
@@ -235,10 +256,28 @@ def build_monitor_points_table(
             }
         )
     return {
-        "title": "表4.2-4 水质监测断面布置",
+        "table_key": SURFACE_TABLE_MONITOR_POINTS,
+        "caption_suffix": "水质监测断面布置",
+        "title": "水质监测断面布置",
         "headers": ["序号", "河流名称", "中心桩号", "取样断面", "取样频次", "监测因子"],
         "rows": rows,
     }
+
+
+def monitor_center_station(evidence: Dict[str, Any], parsed: Dict[str, str]) -> str:
+    value = (
+        evidence.get("中心桩号")
+        or evidence.get("桩号")
+        or evidence.get("监测点位置")
+        or evidence.get("采样位置")
+        or evidence.get("取样位置")
+        or parsed.get("center_station")
+        or ""
+    )
+    text = str(value or "").strip()
+    if not text or "点位编号" in text:
+        return "-"
+    return text
 
 
 def build_monitor_results_table(
@@ -271,7 +310,9 @@ def build_monitor_results_table(
             grouped[key][factor] = record.get("value") or "-"
     headers = ["序号", "河流", "监测时间", *factor_list]
     return {
-        "title": "表4.2-5 现状监测结果表",
+        "table_key": SURFACE_TABLE_MONITOR_RESULTS,
+        "caption_suffix": "现状监测结果表",
+        "title": "现状监测结果表",
         "headers": headers,
         "rows": [grouped[key] for key in sorted(grouped, key=point_date_sort_key)],
     }
@@ -308,6 +349,9 @@ def build_compliance_table(
         not_applicable = bool(result.get("not_applicable")) or method == "not_applicable"
         if not_applicable:
             grouped[key][factor] = "-"
+        elif result.get("method") == "missing_standard":
+            grouped[key][factor] = "缺少水质目标"
+            review_cells[key].add(factor)
         elif result.get("needs_review"):
             grouped[key][factor] = "需复核"
             review_cells[key].add(factor)
@@ -316,7 +360,9 @@ def build_compliance_table(
             grouped[key][factor] = format_index(index)
     headers = ["编号", "监测时间", *evaluated_factors]
     return {
-        "title": "表4.2-6 地表水环境现状评价结果",
+        "table_key": SURFACE_TABLE_COMPLIANCE,
+        "caption_suffix": "地表水环境现状评价结果",
+        "title": "地表水环境现状评价结果",
         "headers": headers,
         "rows": [grouped[key] for key in sorted(grouped, key=point_date_sort_key)],
         "evaluated_factors": evaluated_factors,
@@ -329,6 +375,18 @@ def build_compliance_table(
 
 
 def build_conclusion(results: List[Dict[str, Any]]) -> str:
+    missing_standard_items = [
+        result for result in results
+        if result.get("method") == "missing_standard"
+    ]
+    if missing_standard_items:
+        points = sorted({str(result.get("point_code") or "") for result in missing_standard_items if result.get("point_code")})
+        point_text = "、".join(points) if points else "相关监测断面"
+        return (
+            f"根据监测结果，{point_text}暂未识别到对应的水质目标或执行标准类别，"
+            "评价结果表中相应因子列标注为“缺少水质目标”。"
+            "需补充明确各监测断面的水质目标后，再按《地表水环境质量标准》（GB3838-2002）相应类别进行达标评价。"
+        )
     exceed_items = [
         result for result in results
         if result.get("is_compliant") is False
@@ -400,31 +458,46 @@ def build_compliant_summary(results: List[Dict[str, Any]]) -> str:
     return "；".join(f"{key}的{'、'.join(factors)}" for key, factors in grouped.items()) + "等评价因子"
 
 
+def register_surface_tables(
+    numbering: DocxNumbering,
+    table1: Dict[str, Any],
+    table2: Dict[str, Any],
+    table3: Dict[str, Any],
+) -> None:
+    for table in (table1, table2, table3):
+        table["title"] = numbering.register_table(table["table_key"], table["caption_suffix"])
+
+
 def build_rule_texts(
     table1: Dict[str, Any],
     table2: Dict[str, Any],
     factor_list: List[str],
     results: List[Dict[str, Any]],
     conclusion: str,
+    numbering: DocxNumbering,
 ) -> Dict[str, str]:
+    monitor_points_label = numbering.table_label(SURFACE_TABLE_MONITOR_POINTS)
+    monitor_results_label = numbering.table_label(SURFACE_TABLE_MONITOR_RESULTS)
+    compliance_label = numbering.table_label(SURFACE_TABLE_COMPLIANCE)
     return {
         "monitor_points_text": (
             f"根据项目所在区域的水文特征、河流水体规模，共计在评价范围设置了"
-            f"{len(table1['rows'])}个监测断面进行水质监测。监测断面概况详见表4.2-4。"
+            f"{len(table1['rows'])}个监测断面进行水质监测。监测断面概况详见{monitor_points_label}。"
         ),
         "monitoring_time_method_text": build_monitoring_description(table1, factor_list),
-        "monitoring_result_text": build_surface_water_result_intro(table2),
-        "evaluation_result_intro": "地表水监测点位环境现状评价结果见表4.2-6。",
+        "monitoring_result_text": build_surface_water_result_intro(table2, numbering),
+        "evaluation_result_intro": f"地表水监测点位环境现状评价结果见{compliance_label}。",
         "conclusion": conclusion,
     }
 
 
-def build_surface_water_result_intro(table2: Dict[str, Any]) -> str:
+def build_surface_water_result_intro(table2: Dict[str, Any], numbering: DocxNumbering) -> str:
     dates = unique_ordered(row.get("监测时间") for row in table2.get("rows", []) if row.get("监测时间"))
     date_text = "、".join(dates)
+    label = numbering.table_label(SURFACE_TABLE_MONITOR_RESULTS)
     if date_text:
-        return f"本项目地表水于{date_text}开展现状监测，监测结果详见表4.2-5。"
-    return "本项目地表水监测结果详见表4.2-5。"
+        return f"本项目地表水于{date_text}开展现状监测，监测结果详见{label}。"
+    return f"本项目地表水监测结果详见{label}。"
 
 
 def build_local_water_status(admin_division: str) -> Dict[str, Any]:
@@ -951,41 +1024,96 @@ def build_docx(
     factor_list: List[str],
     evaluated_factors: List[str],
     texts: Dict[str, str],
+    numbering: DocxNumbering,
 ) -> Document:
-    doc = Document()
+    doc = create_section_document()
     setup_document(doc)
 
-    doc.add_heading("1.1.1 地表水环境现状调查与评价", level=1)
+    add_chapter_title(doc, numbering.section_title("surface_water", "地表水环境现状调查与评价"))
     local_status_text = texts.get("local_status_text", "").strip()
     if local_status_text:
-        doc.add_heading("1.1.1.1 区域地表水环境质量现状", level=2)
-        doc.add_paragraph(local_status_text)
+        add_section_heading(doc, numbering.next_level2_heading("surface_water", "区域地表水环境质量现状"))
+        add_body_paragraph(doc, local_status_text)
 
-    doc.add_heading("1.1.1.2 水环境质量现状调查", level=2)
+    add_section_heading(doc, numbering.next_level2_heading("surface_water", "水环境质量现状调查"))
 
-    add_numbered_title(doc, "（1）现状监测点布置")
-    doc.add_paragraph(texts.get("monitor_points_text") or "-")
-    add_caption(doc, table1["title"])
-    add_table(doc, table1["headers"], table1["rows"])
+    landscape_active = False
 
-    add_numbered_title(doc, "（2）监测时间、频率和方法")
-    doc.add_paragraph(texts.get("monitoring_time_method_text") or "-")
+    add_level3_heading(doc, numbering.next_level3_heading("surface_water", "现状监测点布置"))
+    add_body_paragraph(doc, texts.get("monitor_points_text") or "-")
+    add_caption(doc, numbering.table_caption(SURFACE_TABLE_MONITOR_POINTS))
+    add_monitor_points_table(doc, table1["headers"], table1["rows"])
 
-    add_numbered_title(doc, "（3）现状监测结果")
-    doc.add_paragraph(texts.get("monitoring_result_text") or "-")
-    add_caption(doc, table2["title"])
+    add_level3_heading(doc, numbering.next_level3_heading("surface_water", "监测时间、频率和方法"))
+    add_body_paragraph(doc, texts.get("monitoring_time_method_text") or "-")
+
+    add_level3_heading(doc, numbering.next_level3_heading("surface_water", "现状监测结果"))
+    add_body_paragraph(doc, texts.get("monitoring_result_text") or "-")
+    if table_needs_landscape(table2["headers"]):
+        add_landscape_section(doc)
+        landscape_active = True
+    add_caption(doc, numbering.table_caption(SURFACE_TABLE_MONITOR_RESULTS))
     add_table(doc, table2["headers"], table2["rows"])
+    if landscape_active and not table_needs_landscape(table3["headers"]):
+        add_portrait_section(doc)
+        landscape_active = False
 
-    add_numbered_title(doc, "（4）现状评价结果")
-    add_subtitle(doc, "①评价方法")
+    add_level3_heading(doc, numbering.next_level3_heading("surface_water", "现状评价结果"))
+    add_body_paragraph(doc, "①评价方法")
     add_evaluation_method_text(doc)
-    add_subtitle(doc, "②评价结果")
-    doc.add_paragraph(texts.get("evaluation_result_intro") or "-")
-    add_caption(doc, table3["title"])
+    add_body_paragraph(doc, "②评价结果")
+    add_body_paragraph(doc, texts.get("evaluation_result_intro") or "-")
+    if table_needs_landscape(table3["headers"]) and not landscape_active:
+        add_landscape_section(doc)
+        landscape_active = True
+    add_caption(doc, numbering.table_caption(SURFACE_TABLE_COMPLIANCE))
     add_table(doc, table3["headers"], table3["rows"])
+    if landscape_active:
+        add_portrait_section(doc)
 
-    doc.add_paragraph(texts.get("conclusion") or "-")
+    add_body_paragraph(doc, texts.get("conclusion") or "-")
     return doc
+
+
+def add_monitor_points_table(doc: Document, headers: List[str], rows: List[Dict[str, Any]]) -> None:
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.style = TABLE_STYLE
+    table.autofit = True
+    header_cells = table.rows[0].cells
+    for index, header in enumerate(headers):
+        header_cells[index].text = str(header)
+        if HEADER_FILL:
+            shade_cell(header_cells[index], HEADER_FILL)
+        set_cell_text_style(header_cells[index], bold=True)
+
+    for row in rows:
+        cells = table.add_row().cells
+        for index, header in enumerate(headers):
+            cells[index].text = str(row.get(header, "-"))
+            set_cell_text_style(cells[index], bold=False)
+
+    merge_monitor_points_repeated_columns(table, headers, rows)
+    finalize_table(table, header_row_count=1)
+    doc.add_paragraph()
+
+
+def merge_monitor_points_repeated_columns(table: Any, headers: List[str], rows: List[Dict[str, Any]]) -> None:
+    if len(rows) <= 1:
+        return
+    for header in ("取样断面", "取样频次", "监测因子"):
+        if header not in headers:
+            continue
+        values = [normalize_merge_value(row.get(header)) for row in rows]
+        if not values or not values[0] or any(value != values[0] for value in values):
+            continue
+        column_index = headers.index(header)
+        merged_cell = table.cell(1, column_index).merge(table.cell(len(rows), column_index))
+        merged_cell.text = str(rows[0].get(header) or "-")
+        set_cell_text_style(merged_cell, bold=False)
+
+
+def normalize_merge_value(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip())
 
 
 def polish_surface_water_text_with_llm(
@@ -996,12 +1124,17 @@ def polish_surface_water_text_with_llm(
     factor_list: List[str],
     evaluated_factors: List[str],
     results: List[Dict[str, Any]],
+    numbering: DocxNumbering,
 ) -> Dict[str, str]:
+    table_labels = {
+        table["table_key"]: numbering.table_label(table["table_key"])
+        for table in (table1, table2, table3)
+    }
     payload = {
         "enabled": ENABLE_LLM_TEXT_POLISH,
-        "reference_text": read_reference_surface_water_text(),
-        "text_guidance": load_text_polish_guidance(),
+        "text_guidance": load_text_polish_guidance(TEXT_POLISH_GUIDANCE_PATH),
         "rule_texts": rule_texts,
+        "table_labels": table_labels,
         "summary": build_surface_water_summary(table1, table2, factor_list, evaluated_factors, results),
         "table_stats": {
             "monitor_points": len(table1.get("rows", [])),
@@ -1024,18 +1157,37 @@ def polish_surface_water_text_with_llm(
         return rule_texts
 
     try:
-        polished = call_text_polish_llm(build_text_polish_prompt(payload))
-        validation = validate_polished_text(polished, rule_texts, results)
-        write_json(DEBUG_DIR / "surface_water_llm_text_output.json", polished)
+        polished = chat_completion_json_object_with_recovery(
+            [
+                {
+                    "role": "system",
+                    "content": "你只输出合法 JSON 对象，不输出解释。",
+                },
+                {
+                    "role": "user",
+                    "content": build_text_polish_prompt(
+                        payload,
+                        role="地表水环境章节",
+                        output_keys="local_status_text, monitor_points_text, monitoring_time_method_text, monitoring_result_text, evaluation_result_intro, conclusion",
+                    ),
+                },
+            ],
+            profile=LlmProfile.text_polish,
+            label="surface_water_text_polish",
+        )
+        polished_fields = {key: str(polished.get(key, "")).strip() for key in rule_texts}
+        merged = ensure_surface_table_refs({**rule_texts, **polished_fields}, rule_texts, numbering)
+        validation = validate_polished_text(merged, rule_texts, results, numbering)
+        write_json(DEBUG_DIR / "surface_water_llm_text_output.json", merged)
         write_json(DEBUG_DIR / "surface_water_llm_text_validation.json", validation)
         if validation["valid"]:
-            return {**rule_texts, **{key: str(polished[key]).strip() for key in rule_texts}}
+            return merged
         return rule_texts
     except Exception as exc:
         write_json(DEBUG_DIR / "surface_water_llm_text_output.json", {})
         write_json(
             DEBUG_DIR / "surface_water_llm_text_validation.json",
-            {"used_llm": True, "valid": False, "warnings": [str(exc)]},
+            build_rule_text_fallback_validation(exc),
         )
         return rule_texts
 
@@ -1067,118 +1219,41 @@ def build_surface_water_summary(
     }
 
 
-def read_reference_surface_water_text() -> List[str]:
-    reference_path = Path("D:/") / "华设" / "智能体" / "环评报告" / "输出" / "台儿庄高速" / "地表水环境现状调查与评价.docx"
-    if not reference_path.exists():
-        return []
-    try:
-        doc = Document(str(reference_path))
-    except Exception:
-        return []
-    texts = []
-    for paragraph in doc.paragraphs:
-        text = paragraph.text.strip()
-        if text:
-            texts.append(text)
-    return texts[:80]
-
-
-def load_text_polish_guidance() -> Dict[str, Any]:
-    if not TEXT_POLISH_GUIDANCE_PATH.exists():
-        return {}
-    try:
-        payload = json.loads(TEXT_POLISH_GUIDANCE_PATH.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {
-            "config_error": f"{TEXT_POLISH_GUIDANCE_PATH} 不是合法 JSON，已忽略该配置。",
-        }
-    if not isinstance(payload, dict):
-        return {
-            "config_error": f"{TEXT_POLISH_GUIDANCE_PATH} 顶层必须是 JSON 对象，已忽略该配置。",
-        }
-    return payload
-
-
-def build_text_polish_prompt(payload: Dict[str, Any]) -> str:
-    return (
-        "你是环评报告地表水环境章节文字润色助手。只润色文字，不修改任何数字、表号、断面编号、监测日期、标准名称或达标/超标结论。\n"
-        "请参考 reference_text 的中文报告风格，并严格遵循 text_guidance 中可维护的写作要点，润色 rule_texts 中的字段。\n"
-        "text_guidance 是项目配置项，优先级高于 reference_text；如果二者冲突，以 text_guidance 和 rule_texts 的事实数据为准。\n"
-        "输出必须是 JSON 对象，键名必须完整保留：local_status_text, monitor_points_text, monitoring_time_method_text, monitoring_result_text, evaluation_result_intro, conclusion。\n"
-        "禁止输出 Markdown；不得编造生态环境公报内容、监测单位、监测日期、断面数量、评价因子或超标事实。\n"
-        f"输入数据：\n{json.dumps(payload, ensure_ascii=False)}"
-    )
-
-
-def call_text_polish_llm(prompt: str) -> Dict[str, Any]:
-    endpoint = os.getenv("EIA_LLM_ENDPOINT", DEFAULT_ENDPOINT)
-    model = os.getenv("EIA_LLM_MODEL", "qwen-plus")
-    request_payload = {
-        "model": model,
-        "temperature": 0.2,
-        "max_tokens": int(os.getenv("EIA_LLM_TEXT_MAX_TOKENS", "1800")),
-        "messages": [
-            {
-                "role": "system",
-                "content": "你只输出合法 JSON 对象，不输出解释。",
-            },
-            {"role": "user", "content": prompt},
-        ],
+def ensure_surface_table_refs(
+    texts: Dict[str, str],
+    rule_texts: Dict[str, str],
+    numbering: DocxNumbering,
+) -> Dict[str, str]:
+    result = dict(texts)
+    field_table_keys = {
+        "monitor_points_text": SURFACE_TABLE_MONITOR_POINTS,
+        "monitoring_result_text": SURFACE_TABLE_MONITOR_RESULTS,
+        "evaluation_result_intro": SURFACE_TABLE_COMPLIANCE,
     }
-    last_error: Optional[Exception] = None
-    for attempt in range(1, LLM_MAX_RETRIES + 1):
-        started = time.time()
-        req = urllib.request.Request(
-            endpoint,
-            data=json.dumps(request_payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {os.getenv('EIA_LLM_API_KEY')}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            print(f"Surface water LLM text polish attempt {attempt}/{LLM_MAX_RETRIES}", flush=True)
-            with urllib.request.urlopen(req, timeout=LLM_TIMEOUT_SECONDS, context=SSL_CONTEXT) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            content = data["choices"][0]["message"]["content"]
-            parsed = parse_json_object(content)
-            print(f"Surface water LLM text polish succeeded in {int((time.time() - started) * 1000)}ms", flush=True)
-            return parsed
-        except (
-            urllib.error.URLError,
-            TimeoutError,
-            KeyError,
-            json.JSONDecodeError,
-            ValueError,
-        ) as exc:
-            last_error = exc
-            print(f"Surface water LLM text polish failed on attempt {attempt}/{LLM_MAX_RETRIES}: {exc}", flush=True)
-            if attempt < LLM_MAX_RETRIES:
-                time.sleep(LLM_RETRY_DELAY_SECONDS * attempt)
-    raise RuntimeError(f"Surface water LLM text polish failed: {last_error}")
-
-
-def parse_json_object(content: str) -> Dict[str, Any]:
-    text = content.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end >= start:
-        text = text[start:end + 1]
-    parsed = json.loads(text)
-    if not isinstance(parsed, dict):
-        raise ValueError("Surface water LLM text polish response must be a JSON object")
-    return parsed
+    for field, table_key in field_table_keys.items():
+        label = numbering.table_label(table_key)
+        current = str(result.get(field, "")).strip()
+        if label in current:
+            continue
+        rule = str(rule_texts.get(field, "")).strip()
+        if label not in rule:
+            continue
+        match = re.search(rf"[^。]*{re.escape(label)}[^。]*。?", rule)
+        if match and current:
+            clause = match.group(0).strip()
+            if not current.endswith("。"):
+                current += "。"
+            result[field] = current + clause
+        else:
+            result[field] = rule
+    return result
 
 
 def validate_polished_text(
     polished: Dict[str, Any],
     rule_texts: Dict[str, str],
     results: List[Dict[str, Any]],
+    numbering: DocxNumbering,
 ) -> Dict[str, Any]:
     warnings: List[str] = []
     for key in rule_texts:
@@ -1186,9 +1261,17 @@ def validate_polished_text(
             warnings.append(f"missing or empty field: {key}")
 
     all_text = "\n".join(str(polished.get(key, "")) for key in rule_texts)
-    for pattern in ("表4.2-4", "表4.2-5", "表4.2-6"):
-        if pattern in "\n".join(rule_texts.values()) and pattern not in all_text:
-            warnings.append(f"missing table reference: {pattern}")
+    table_field_checks = {
+        SURFACE_TABLE_MONITOR_POINTS: "monitor_points_text",
+        SURFACE_TABLE_MONITOR_RESULTS: "monitoring_result_text",
+        SURFACE_TABLE_COMPLIANCE: "evaluation_result_intro",
+    }
+    for table_key, field in table_field_checks.items():
+        label = numbering.table_label(table_key)
+        field_text = str(polished.get(field, ""))
+        rule_text = str(rule_texts.get(field, ""))
+        if label in rule_text and label not in field_text:
+            warnings.append(f"missing table reference: {label}")
 
     exceed_items = [item for item in results if item.get("is_compliant") is False]
     conclusion = str(polished.get("conclusion", ""))
@@ -1202,7 +1285,7 @@ def validate_polished_text(
         if factor and factor not in all_text:
             warnings.append(f"missing exceed factor: {factor}")
 
-    return {"used_llm": True, "valid": not warnings, "warnings": warnings}
+    return {"used_llm": True, "valid": not warnings, "llm_applied": True, "warnings": warnings}
 
 
 def has_unqualified_all_compliant_claim(conclusion: str) -> bool:
@@ -1230,138 +1313,29 @@ def is_qualified_compliant_sentence(sentence: str) -> bool:
     return False
 
 
-def setup_document(doc: Document) -> None:
-    section = doc.sections[0]
-    section.orientation = WD_ORIENT.LANDSCAPE
-    section.page_width, section.page_height = section.page_height, section.page_width
-    section.top_margin = Cm(1.8)
-    section.bottom_margin = Cm(1.8)
-    section.left_margin = Cm(1.6)
-    section.right_margin = Cm(1.6)
-
-    styles = doc.styles
-    normal = styles["Normal"]
-    normal.font.name = "宋体"
-    normal._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-    normal.font.size = Pt(10.5)
-    normal.font.color.rgb = RGBColor(0, 0, 0)
-
-    for style_name, size in [("Heading 1", 14), ("Heading 2", 12), ("Heading 3", 11)]:
-        style = styles[style_name]
-        style.font.name = "黑体"
-        style._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
-        style.font.size = Pt(size)
-        style.font.color.rgb = RGBColor(0, 0, 0)
-
-
-def add_numbered_title(doc: Document, text: str) -> None:
-    paragraph = doc.add_paragraph()
-    run = paragraph.add_run(text)
-    run.bold = True
-
-
-def add_subtitle(doc: Document, text: str) -> None:
-    paragraph = doc.add_paragraph()
-    run = paragraph.add_run(text)
-    run.bold = True
-
-
-def add_caption(doc: Document, text: str) -> None:
-    paragraph = doc.add_paragraph()
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = paragraph.add_run(text)
-    run.bold = True
-
-
-def add_table(doc: Document, headers: List[str], rows: List[Dict[str, Any]]) -> None:
-    table = doc.add_table(rows=1, cols=len(headers))
-    table.style = "Table Grid"
-    table.autofit = True
-    header_cells = table.rows[0].cells
-    for index, header in enumerate(headers):
-        header_cells[index].text = str(header)
-        shade_cell(header_cells[index], "EDEDED")
-        set_cell_text_style(header_cells[index], bold=True)
-
-    for row in rows:
-        cells = table.add_row().cells
-        for index, header in enumerate(headers):
-            cells[index].text = str(row.get(header, "-"))
-            set_cell_text_style(cells[index], bold=False)
-
-    for row in table.rows:
-        for cell in row.cells:
-            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-            set_cell_margin(cell)
-    doc.add_paragraph()
-
-
 def add_evaluation_method_text(doc: Document) -> None:
-    doc.add_paragraph("现状监测结果按水质指数法进行单项水质参数评价，计算公式如下：")
+    add_body_paragraph(doc, "现状监测结果按水质指数法进行单项水质参数评价，计算公式如下：")
     add_formula(doc, "Sᵢ,ⱼ = Cᵢ,ⱼ / Cₛᵢ")
-    doc.add_paragraph("式中：Sᵢ,ⱼ——评价因子i的水质指数，大于1表明该水质因子超标；")
-    doc.add_paragraph("Cᵢ,ⱼ——评价因子i在j点的实测统计代表值，mg/L；")
-    doc.add_paragraph("Cₛᵢ——评价因子i的水质评价标准限值，mg/L。")
-    doc.add_paragraph("其中，pH的标准指数为：")
+    add_body_paragraph(doc, "式中：Sᵢ,ⱼ——评价因子i的水质指数，大于1表明该水质因子超标；")
+    add_body_paragraph(doc, "Cᵢ,ⱼ——评价因子i在j点的实测统计代表值，mg/L；")
+    add_body_paragraph(doc, "Cₛᵢ——评价因子i的水质评价标准限值，mg/L。")
+    add_body_paragraph(doc, "其中，pH的标准指数为：")
     add_formula(doc, "SₚH,ⱼ = (7.0 - pHⱼ) / (7.0 - pHsd)        （pHⱼ≤7.0）")
     add_formula(doc, "SₚH,ⱼ = (pHⱼ - 7.0) / (pHsu - 7.0)        （pHⱼ＞7.0）")
-    doc.add_paragraph("DO的标准指数为：")
+    add_body_paragraph(doc, "DO的标准指数为：")
     add_formula(doc, "DOsat = 468 / (31.6 + T)")
     add_formula(doc, "SᴅO,ⱼ = |DOf - DOⱼ| / (DOf - DOs)        （DOⱼ≥DOs）")
     add_formula(doc, "SᴅO,ⱼ = 10 - 9DOⱼ / DOs        （DOⱼ＜DOs）")
-    doc.add_paragraph("式中：SₚH,ⱼ——pH值的指数，大于1表明该水质因子超标；")
-    doc.add_paragraph("pHⱼ——pH值实测统计代表值；")
-    doc.add_paragraph("pHsd——评价标准中pH值的下限值；")
-    doc.add_paragraph("pHsu——评价标准中pH值的上限值；")
-    doc.add_paragraph("SᴅO,ⱼ——溶解氧的标准指数，大于1表明该水质因子超标；")
-    doc.add_paragraph("DOⱼ——溶解氧在j点的实测统计代表值，mg/L；")
-    doc.add_paragraph("DOs——溶解氧的水质评价标准限值，mg/L；")
-    doc.add_paragraph("DOf——饱和溶解氧浓度，mg/L；")
-    doc.add_paragraph("T——水温，℃。")
-    doc.add_paragraph("水温、悬浮物等无相应限值的指标仅列出现状监测值，不参与标准指数评价。")
-
-
-def add_formula(doc: Document, text: str) -> None:
-    paragraph = doc.add_paragraph()
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = paragraph.add_run(text)
-    run.font.name = "Times New Roman"
-    run._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-    run.font.size = Pt(10.5)
-    run.font.color.rgb = RGBColor(0, 0, 0)
-
-
-def set_cell_text_style(cell: Any, bold: bool = False) -> None:
-    for paragraph in cell.paragraphs:
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        for run in paragraph.runs:
-            run.font.name = "宋体"
-            run._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-            run.font.size = Pt(8)
-            run.font.color.rgb = RGBColor(0, 0, 0)
-            run.bold = bold
-
-
-def shade_cell(cell: Any, fill: str) -> None:
-    tc_pr = cell._tc.get_or_add_tcPr()
-    shading = OxmlElement("w:shd")
-    shading.set(qn("w:fill"), fill)
-    tc_pr.append(shading)
-
-
-def set_cell_margin(cell: Any, margin: int = 80) -> None:
-    tc_pr = cell._tc.get_or_add_tcPr()
-    tc_mar = tc_pr.first_child_found_in("w:tcMar")
-    if tc_mar is None:
-        tc_mar = OxmlElement("w:tcMar")
-        tc_pr.append(tc_mar)
-    for side in ("top", "left", "bottom", "right"):
-        node = tc_mar.find(qn(f"w:{side}"))
-        if node is None:
-            node = OxmlElement(f"w:{side}")
-            tc_mar.append(node)
-        node.set(qn("w:w"), str(margin))
-        node.set(qn("w:type"), "dxa")
+    add_body_paragraph(doc, "式中：SₚH,ⱼ——pH值的指数，大于1表明该水质因子超标；")
+    add_body_paragraph(doc, "pHⱼ——pH值实测统计代表值；")
+    add_body_paragraph(doc, "pHsd——评价标准中pH值的下限值；")
+    add_body_paragraph(doc, "pHsu——评价标准中pH值的上限值；")
+    add_body_paragraph(doc, "SᴅO,ⱼ——溶解氧的标准指数，大于1表明该水质因子超标；")
+    add_body_paragraph(doc, "DOⱼ——溶解氧在j点的实测统计代表值，mg/L；")
+    add_body_paragraph(doc, "DOs——溶解氧的水质评价标准限值，mg/L；")
+    add_body_paragraph(doc, "DOf——饱和溶解氧浓度，mg/L；")
+    add_body_paragraph(doc, "T——水温，℃。")
+    add_body_paragraph(doc, "水温、悬浮物等无相应限值的指标仅列出现状监测值，不参与标准指数评价。")
 
 
 def build_monitoring_description(table1: Dict[str, Any], factor_list: List[str]) -> str:
@@ -1457,6 +1431,87 @@ def format_index(value: Any) -> str:
         return f"{float(value):.2f}"
     except (TypeError, ValueError):
         return "需复核"
+
+
+def load_surface_section_texts(output_dir: Path) -> Dict[str, str]:
+    debug_dir = output_dir / "debug_tables"
+    texts_path = debug_dir / "surface_water_section_texts.json"
+    if texts_path.exists():
+        payload = read_json(texts_path)
+        if isinstance(payload, dict) and payload:
+            return {key: str(value) for key, value in payload.items()}
+    output_path = debug_dir / "surface_water_llm_text_output.json"
+    if output_path.exists():
+        payload = read_json(output_path)
+        if isinstance(payload, dict) and payload:
+            texts = {key: str(value) for key, value in payload.items()}
+            local_status = read_json(debug_dir / "surface_water_local_status.json")
+            if isinstance(local_status, dict):
+                texts.setdefault("local_status_text", str(local_status.get("text") or ""))
+            return texts
+    input_path = debug_dir / "surface_water_llm_text_input.json"
+    if input_path.exists():
+        payload = read_json(input_path)
+        rule_texts = payload.get("rule_texts") if isinstance(payload, dict) else None
+        if isinstance(rule_texts, dict) and rule_texts:
+            texts = {key: str(value) for key, value in rule_texts.items()}
+            local_status = read_json(debug_dir / "surface_water_local_status.json")
+            if isinstance(local_status, dict):
+                texts["local_status_text"] = str(local_status.get("text") or "")
+            return texts
+    raise FileNotFoundError("未找到可重建地表水章节的文本 JSON")
+
+
+def rebuild_docx_from_output(
+    output_dir: Path,
+    numbering: DocxNumbering,
+    label_mapping: Optional[Dict[str, str]] = None,
+) -> Path:
+    output_dir = Path(output_dir)
+    debug_dir = output_dir / "debug_tables"
+    table1 = read_json(debug_dir / "surface_water_monitor_points_table.json")
+    table2 = read_json(debug_dir / "surface_water_monitor_results_table.json")
+    table3 = read_json(debug_dir / "surface_water_compliance_table.json")
+    ensure_surface_table_metadata(table1, table2, table3)
+    detected = read_json(debug_dir / "detected_factors.json")
+    factor_list = detected.get("factor_list") if isinstance(detected, dict) else []
+    if not isinstance(factor_list, list):
+        factor_list = []
+    evaluated_factors = [
+        header
+        for header in table3.get("headers", [])[2:]
+        if str(header).strip()
+    ]
+
+    numbering.begin_section("surface_water", "地表水环境现状调查与评价")
+    numbering.reset_section_heading_counters("surface_water")
+    register_surface_tables(numbering, table1, table2, table3)
+
+    texts = load_surface_section_texts(output_dir)
+    if label_mapping:
+        texts = numbering.remap_text_fields(texts, label_mapping)
+
+    doc = build_docx(table1, table2, table3, factor_list, evaluated_factors, texts, numbering)
+    finalize_section_document(doc)
+    doc_path = output_dir / "surface_water_section.docx"
+    doc.save(doc_path)
+    return doc_path
+
+
+def ensure_surface_table_metadata(
+    table1: Dict[str, Any],
+    table2: Dict[str, Any],
+    table3: Dict[str, Any],
+) -> None:
+    defaults = [
+        (table1, SURFACE_TABLE_MONITOR_POINTS, "水质监测断面布置"),
+        (table2, SURFACE_TABLE_MONITOR_RESULTS, "现状监测结果表"),
+        (table3, SURFACE_TABLE_COMPLIANCE, "地表水环境现状评价结果"),
+    ]
+    for table, table_key, caption_suffix in defaults:
+        table.setdefault("table_key", table_key)
+        table.setdefault("caption_suffix", caption_suffix)
+        table.setdefault("title", caption_suffix)
 
 
 if __name__ == "__main__":

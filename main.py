@@ -23,9 +23,13 @@ from noise_table_preprocessor import (
 from observability import RunLogger
 from word_processor import load_docx_chunks
 
-MAX_CHUNKS_PER_RUN = 20
+DEFAULT_MAX_CHUNKS_PER_RUN = 20
 MAX_LLM_PART_CHARS = 3400
 ENABLE_LLM_EXTRACTION = os.getenv("ENABLE_LLM_EXTRACTION", "false").lower() == "true"
+
+
+def max_chunks_per_run() -> int:
+    return int(os.getenv("EIA_MAX_CHUNKS_PER_RUN", str(DEFAULT_MAX_CHUNKS_PER_RUN)))
 
 HEADER_KEYWORD_RE = re.compile(
     r"点位|断面|位置|测点|采样|日期|时间|因子|项目|指标|检测|监测|结果|数值|浓度|单位|"
@@ -45,15 +49,16 @@ def analyze_docx_files(input_paths: List[Path]) -> Dict[str, Any]:
     all_chunks: List[Dict[str, Any]] = []
     extraction_chunks = 0
     processed_chunks = 0
-    logger = RunLogger()
+    run_log_root = Path(os.getenv("EIA_RUN_LOG_DIR", os.getenv("EIA_OUTPUT_DIR", "output"))) / "extraction_logs"
+    logger = RunLogger(root=run_log_root)
     debug_table_index = 0
 
     for path in input_paths:
         chunks = load_docx_chunks(path)
 
         for chunk in chunks:
-            if processed_chunks >= MAX_CHUNKS_PER_RUN:
-                print(f"Reached chunk limit: {MAX_CHUNKS_PER_RUN}")
+            if processed_chunks >= max_chunks_per_run():
+                print(f"Reached chunk limit: {max_chunks_per_run()}")
                 break
 
             processed_chunks += 1
@@ -74,7 +79,7 @@ def analyze_docx_files(input_paths: List[Path]) -> Dict[str, Any]:
                         },
                     )
             print(
-                f"Processing chunk {processed_chunks}/{MAX_CHUNKS_PER_RUN}: "
+                f"Processing chunk {processed_chunks}/{max_chunks_per_run()}: "
                 f"{chunk['chunk_id']} [{chunk_type}]",
                 flush=True,
             )
@@ -169,7 +174,7 @@ def analyze_docx_files(input_paths: List[Path]) -> Dict[str, Any]:
             print(f"Chunk total: {len(chunk_records)} record(s)", flush=True)
             all_records.extend(chunk_records)
 
-        if processed_chunks >= MAX_CHUNKS_PER_RUN:
+        if processed_chunks >= max_chunks_per_run():
             break
 
     deduped_records = normalize_evidence_objects(dedupe_output_records(all_records))
@@ -739,7 +744,7 @@ def elapsed_ms(started: float) -> int:
 
 
 def export_debug_chunk(chunk: Dict[str, Any], index: int) -> None:
-    debug_root = Path("output/debug_chunks")
+    debug_root = Path(os.getenv("EIA_OUTPUT_DIR", "output")) / "debug_chunks"
     debug_root.mkdir(parents=True, exist_ok=True)
     safe_id = re.sub(r"[^0-9A-Za-z_.-]+", "_", chunk.get("chunk_id") or f"chunk_{index}")
     payload = {
