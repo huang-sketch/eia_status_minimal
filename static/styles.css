@@ -338,6 +338,17 @@ main {
   padding: 9px 12px;
 }
 
+.download-group-title {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  margin-top: 6px;
+}
+
+.download-group-title:first-child {
+  margin-top: 0;
+}
+
 .sidebar-logs-card {
   flex: 1;
   min-height: 160px;

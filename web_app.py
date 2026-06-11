@@ -704,6 +704,15 @@ def project_table_columns(table: Dict[str, Any], columns: List[str]) -> Dict[str
     projected["headers"] = headers
     projected["rows"] = projected_rows
     projected["row_count"] = len(projected_rows)
+    subtables = []
+    for subtable in table.get("subtables") or []:
+        if isinstance(subtable, dict):
+            subtable_preview = dict(subtable)
+            subtable_preview.setdefault("source_path", table.get("source_path", ""))
+            subtable_preview.setdefault("exists", table.get("exists", True))
+            subtables.append(project_table_columns(subtable_preview, columns))
+    if subtables:
+        projected["subtables"] = subtables
     return projected
 
 
@@ -723,14 +732,17 @@ def read_table_preview(output_dir: Path, relative_path: str) -> Dict[str, Any]:
         headers = infer_headers(payload)
         rows = payload
         title = path.stem
+        subtables = []
     elif isinstance(payload, dict):
         rows = payload.get("rows") or payload.get("records") or []
         headers = payload.get("headers") or payload.get("flattened_headers") or infer_headers(rows)
         title = payload.get("title") or payload.get("table_title") or path.stem
+        subtables = payload.get("subtables") or []
     else:
         headers = []
         rows = []
         title = path.stem
+        subtables = []
 
     return {
         "title": title,
@@ -739,6 +751,7 @@ def read_table_preview(output_dir: Path, relative_path: str) -> Dict[str, Any]:
         "source_path": relative_path,
         "exists": True,
         "row_count": len(rows) if isinstance(rows, list) else 0,
+        "subtables": subtables if isinstance(subtables, list) else [],
     }
 
 

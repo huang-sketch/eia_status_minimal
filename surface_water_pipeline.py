@@ -25,6 +25,8 @@ SURFACE_WATER_FACTORS = {
     "TP",
     "溶解氧",
     "DO",
+    "化学需氧量",
+    "COD",
 }
 
 LIMITS: Dict[str, Dict[str, Any]] = {
@@ -35,6 +37,7 @@ LIMITS: Dict[str, Dict[str, Any]] = {
         "氨氮": 0.15,
         "总磷": 0.02,
         "石油类": 0.05,
+        "化学需氧量": 15.0,
     },
     "Ⅱ类": {
         "pH值": (6.0, 9.0),
@@ -43,6 +46,7 @@ LIMITS: Dict[str, Dict[str, Any]] = {
         "氨氮": 0.5,
         "总磷": 0.1,
         "石油类": 0.05,
+        "化学需氧量": 15.0,
     },
     "Ⅲ类": {
         "pH值": (6.0, 9.0),
@@ -51,6 +55,7 @@ LIMITS: Dict[str, Dict[str, Any]] = {
         "氨氮": 1.0,
         "总磷": 0.2,
         "石油类": 0.05,
+        "化学需氧量": 20.0,
     },
     "Ⅳ类": {
         "pH值": (6.0, 9.0),
@@ -59,6 +64,7 @@ LIMITS: Dict[str, Dict[str, Any]] = {
         "氨氮": 1.5,
         "总磷": 0.3,
         "石油类": 0.5,
+        "化学需氧量": 30.0,
     },
     "Ⅴ类": {
         "pH值": (6.0, 9.0),
@@ -67,6 +73,7 @@ LIMITS: Dict[str, Dict[str, Any]] = {
         "氨氮": 2.0,
         "总磷": 0.4,
         "石油类": 1.0,
+        "化学需氧量": 40.0,
     },
 }
 
@@ -97,6 +104,7 @@ def main() -> None:
     cli_records = adapt_cli_surface_water_records(cli_raw_records)
     rule_records = parse_surface_water_records(report_path)
     records = merge_cli_and_rule_records(cli_records, rule_records)
+    align_surface_water_record_point_codes(records, standard_config)
     write_json(
         debug_dir / "extraction_summary.json",
         build_extraction_summary(cli_records, rule_records, records, extraction_available),
@@ -179,9 +187,6 @@ def parse_standard_config(plan_path: Path) -> Dict[str, Any]:
             )
             if not point_code:
                 continue
-            if not standard_class:
-                warnings.append(f"{point_code} 未识别到标准类别: {row}")
-                continue
             river_name = (
                 canonical.get("river_name")
                 or get_row_value(row, header_map, "河流名称", None)
@@ -203,6 +208,8 @@ def parse_standard_config(plan_path: Path) -> Dict[str, Any]:
                 "evidence": row_to_evidence(headers, row),
                 "limits": LIMITS.get(standard_class, {}),
             }
+            if not standard_class:
+                warnings.append(f"{point_code} 缺少水质目标")
 
     return {
         "standard_name": STANDARD_NAME,
@@ -220,7 +227,7 @@ def parse_surface_water_records(report_path: Path) -> List[Dict[str, Any]]:
             continue
         table_title = ((chunk.get("metadata") or {}).get("table_title") or "")
         table_text = chunk.get("text") or ""
-        if "地表水检测结果" not in table_title and "采样位置" not in table_text:
+        if not is_surface_water_result_table(table_title, table_text):
             continue
         rows = parse_table_rows(table_text)
         if not rows:
@@ -324,7 +331,7 @@ def evaluate_compliance(
             else:
                 standard_index = calc_do_index(value, float(limit_value), float(temperature))
                 is_compliant = standard_index <= 1
-        elif factor in {"高锰酸盐指数", "氨氮", "总磷", "石油类"}:
+        elif factor in {"高锰酸盐指数", "氨氮", "总磷", "石油类", "化学需氧量"}:
             method = "value_div_limit"
             limit_value = LIMITS[standard_class][factor]
             standard_index = value / float(limit_value)
@@ -396,10 +403,34 @@ def row_to_evidence(headers: List[str], row: List[str]) -> Dict[str, Any]:
 
 
 def extract_point_code(text: str) -> Optional[str]:
-    match = re.search(r"(?<![A-Za-z0-9])WJ\s*\d+", text or "", flags=re.IGNORECASE)
+    match = re.search(r"(?<![A-Za-z0-9])(?:WJ|D)\s*\d+", text or "", flags=re.IGNORECASE)
     if match:
         return re.sub(r"\s+", "", match.group(0)).upper()
     return match.group(0) if match else None
+
+
+def align_surface_water_record_point_codes(
+    records: List[Dict[str, Any]],
+    standard_config: Dict[str, Any],
+) -> None:
+    points = standard_config.get("points") or {}
+    if not points:
+        return
+    for record in records:
+        code = str(record.get("point_code") or "").strip().upper()
+        if not code or code in points:
+            continue
+        match = re.search(r"(\d+)$", code)
+        if not match:
+            continue
+        candidates = [
+            point_code
+            for point_code in points
+            if re.search(rf"{re.escape(match.group(1))}$", str(point_code or ""))
+        ]
+        if len(candidates) == 1:
+            record["raw_point_code"] = code
+            record["point_code"] = candidates[0]
 
 
 def normalize_standard_class(text: str) -> Optional[str]:
@@ -436,13 +467,30 @@ def normalize_standard_class(text: str) -> Optional[str]:
     return None
 
 
+def is_surface_water_result_table(table_title: str, table_text: str) -> bool:
+    text = f"{table_title}\n{table_text}"
+    if any(marker in text for marker in ("地表水检测结果", "地表水监测结果", "水质检测结果", "水质监测结果")):
+        return True
+    if "采样位置" in text or "监测断面" in text or "断面位置" in text:
+        if any(factor in text for factor in ("pH", "DO", "溶解氧", "高锰酸盐指数", "氨氮", "总磷", "石油类")):
+            return True
+    if re.search(r"\bWJ\s*\d+\b", text, flags=re.IGNORECASE) and any(
+        factor in text for factor in ("pH", "DO", "溶解氧", "高锰酸盐指数", "氨氮", "总磷", "石油类")
+    ):
+        return True
+    return False
+
+
 def normalize_factor(text: str) -> str:
     text = str(text or "").strip()
     aliases = {
         "pH": "pH值",
         "PH": "pH值",
         "TP": "总磷",
+        "NH3-N": "氨氮",
+        "NH₃-N": "氨氮",
         "DO": "溶解氧",
+        "COD": "化学需氧量",
         "SS": "悬浮物",
     }
     return aliases.get(text, text)

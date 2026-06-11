@@ -53,6 +53,23 @@ function isExceedCell(header, value, tableType) {
 function renderTable(containerId, table, tableType, jobId) {
   const container = document.getElementById(containerId);
   if (!container) return;
+  container.innerHTML = renderTableMarkup(table || {}, tableType, jobId);
+}
+
+function renderTableGroup(containerId, table, tableType, jobId) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+  const subtables = Array.isArray(table?.subtables)
+    ? table.subtables.filter((item) => item && item.exists !== false && Array.isArray(item.rows) && item.rows.length)
+    : [];
+  if (!subtables.length) {
+    container.innerHTML = renderTableMarkup(table || {}, tableType, jobId);
+    return;
+  }
+  container.innerHTML = subtables.map((subtable) => renderTableMarkup(subtable, tableType, jobId)).join("");
+}
+
+function renderTableMarkup(table, tableType, jobId) {
   const headers = table.headers || [];
   const rows = table.rows || [];
   const previewRows = rows.slice(0, 50);
@@ -60,8 +77,7 @@ function renderTable(containerId, table, tableType, jobId) {
   const title = table.title || "暂无数据";
 
   if (!table.exists || !rows.length) {
-    container.innerHTML = `<div class="empty-state" style="padding:32px;"><div class="empty-state-icon">—</div><p>暂无可展示数据</p></div>`;
-    return;
+    return `<div class="empty-state" style="padding:32px;"><div class="empty-state-icon">—</div><p>暂无可展示数据</p></div>`;
   }
 
   const downloadHref = `/api/jobs/${jobId}/download/${encodeURI(sourcePath)}`;
@@ -77,7 +93,7 @@ function renderTable(containerId, table, tableType, jobId) {
     return `<tr class="${review ? "review-row" : ""}">${cells}</tr>`;
   }).join("");
 
-  container.innerHTML = `
+  return `
     <div class="table-toolbar">
       <div>
         <div class="table-title">${escapeHtml(title)}</div>
@@ -116,19 +132,28 @@ function renderNoiseSummary(summary) {
 function renderTextDownloads(groups, jobId) {
   const container = document.getElementById("textDownloads");
   if (!container) return;
-  const files = groups.text_output?.files || [];
+  const orderedGroups = ["text_output", "monitoring_extraction", "compliance"];
+  const sections = orderedGroups
+    .map((key) => ({ key, title: groups[key]?.title || key, files: groups[key]?.files || [] }))
+    .filter((group) => group.files.length);
   container.innerHTML = "";
-  if (!files.length) {
+  if (!sections.length) {
     container.innerHTML = `<div class="empty-state" style="padding:24px;width:100%;"><p>暂无文本输出文件</p></div>`;
     return;
   }
-  files.forEach((file) => {
-    const link = document.createElement("a");
-    link.className = "download-button";
-    link.href = `/api/jobs/${jobId}/download/${encodeURI(file.path)}`;
-    link.textContent = downloadLabel(file.name);
-    link.target = "_blank";
-    container.appendChild(link);
+  sections.forEach((section) => {
+    const heading = document.createElement("div");
+    heading.className = "download-group-title";
+    heading.textContent = section.title;
+    container.appendChild(heading);
+    section.files.forEach((file) => {
+      const link = document.createElement("a");
+      link.className = "download-button";
+      link.href = `/api/jobs/${jobId}/download/${encodeURI(file.path)}`;
+      link.textContent = downloadLabel(file.name);
+      link.target = "_blank";
+      container.appendChild(link);
+    });
   });
 }
 

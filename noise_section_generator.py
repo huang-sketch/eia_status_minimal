@@ -10,6 +10,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 from docx_layout import (
     HEADER_FILL,
@@ -34,6 +36,7 @@ from llm_client import (
     LLM_TEXT_BATCH_PAUSE_SECONDS,
     LlmProfile,
     build_rule_text_fallback_validation,
+    chat_completion_json_object,
     chat_completion_json_object_with_recovery,
     is_network_error,
 )
@@ -83,22 +86,20 @@ def main() -> None:
     all_records = [*area_records, *traffic_records]
     if not all_records:
         raise FileNotFoundError(f"未找到可用的噪声监测结果扁平化表: {DEBUG_DIR}")
+    apply_noise_result_meta_to_plan_rows(plan_rows, all_records)
 
-    validate_plan_report_match(all_records, plan_rows)
-    standard_warnings = [
-        f"{row.get('point_code')} 未识别现状标准: {row.get('standard_class') or '空'}"
-        for row in plan_rows
-        if row.get("standard_class") not in DAY_LIMITS
-        or row.get("standard_class") not in NIGHT_LIMITS
-    ]
+    mismatch_warnings = validate_plan_report_match(all_records, plan_rows)
+    standard_warnings = build_noise_standard_warnings(plan_rows)
+    plan_meta_warnings = build_noise_plan_meta_warnings(plan_rows)
+    flow_unit_warnings = build_flow_unit_warnings(all_records)
     position_warnings = build_plan_report_position_warnings(all_records, plan_rows)
     record_data_validation(
         OUTPUT_DIR,
         "noise_data",
-        valid=not standard_warnings and not position_warnings,
-        warnings=[*standard_warnings, *position_warnings],
+        valid=not standard_warnings and not plan_meta_warnings and not flow_unit_warnings and not mismatch_warnings and not position_warnings,
+        warnings=[*standard_warnings, *plan_meta_warnings, *flow_unit_warnings, *mismatch_warnings, *position_warnings],
     )
-    table1 = build_monitor_points_table(plan_rows)
+    table1 = build_monitor_points_table(plan_rows, all_records)
     table2 = build_sensitive_result_table(all_records, plan_rows)
     table_indoor = build_indoor_result_table(table2)
     table3 = build_attenuation_result_table(traffic_records, plan_rows)
@@ -112,6 +113,7 @@ def main() -> None:
     write_json(DEBUG_DIR / "noise_sensitive_points_result_table.json", table2)
     write_json(DEBUG_DIR / "noise_indoor_result_table.json", table_indoor)
     write_json(DEBUG_DIR / "traffic_noise_attenuation_table.json", table3)
+    write_json(DEBUG_DIR / "noise_result_name_position_debug.json", collect_result_name_position_debug(table2, table3))
     monitoring_meta = build_noise_monitoring_meta(all_records, plan_rows)
     summary["monitoring_meta"] = monitoring_meta
     write_json(DEBUG_DIR / "noise_compliance_summary.json", summary)
@@ -139,14 +141,31 @@ def parse_noise_plan() -> List[Dict[str, Any]]:
     )
     chunks = load_docx_chunks(plan_path)
     defaults = extract_noise_plan_defaults(chunks)
+    detection: List[Dict[str, Any]] = []
     for chunk in chunks:
         if chunk.get("kind") != "table":
             continue
         title = (chunk.get("metadata") or {}).get("table_title") or ""
-        if "声环境" not in title:
+        title_score = noise_plan_title_score(title)
+        if title_score < 0:
+            detection.append(
+                {
+                    "source_table": chunk.get("chunk_id"),
+                    "table_title": title,
+                    "skipped_reason": "excluded_by_title",
+                }
+            )
             continue
         rows = parse_table_rows(chunk.get("text") or "")
         if len(rows) < 2:
+            detection.append(
+                {
+                    "source_table": chunk.get("chunk_id"),
+                    "table_title": title,
+                    "skipped_reason": "too_few_rows",
+                    "row_count": len(rows),
+                }
+            )
             continue
         headers = rows[0]
         schema_result = resolve_table_schema(
@@ -159,6 +178,16 @@ def parse_noise_plan() -> List[Dict[str, Any]]:
             job_id=OUTPUT_DIR.parent.name,
         )
         if not schema_result["validation"]["valid"]:
+            detection.append(
+                {
+                    "source_table": chunk.get("chunk_id"),
+                    "table_title": title,
+                    "headers": headers,
+                    "title_score": title_score,
+                    "schema_validation": schema_result["validation"],
+                    "skipped_reason": "schema_invalid",
+                }
+            )
             continue
         parsed = [
             normalize_plan_row(
@@ -173,10 +202,37 @@ def parse_noise_plan() -> List[Dict[str, Any]]:
             for row in rows[1:]
             if len(row) >= 5
         ]
-        parsed = [row for row in parsed if row.get("point_code")]
+        parsed = [row for row in parsed if is_valid_noise_point_code(row.get("point_code"))]
+        detection.append(
+            {
+                "source_table": chunk.get("chunk_id"),
+                "table_title": title,
+                "headers": headers,
+                "title_score": title_score,
+                "schema_validation": schema_result["validation"],
+                "parsed_rows": len(parsed),
+                "accepted": bool(parsed),
+            }
+        )
         if parsed:
+            write_json(DEBUG_DIR / "noise_plan_table_detection.json", detection)
             return parsed
+    write_json(DEBUG_DIR / "noise_plan_table_detection.json", detection)
     raise RuntimeError("未找到声环境现状监测方案表")
+
+
+def noise_plan_title_score(title: str) -> int:
+    text = str(title or "")
+    if any(word in text for word in ("振动", "底泥", "土壤", "地下水", "地表水", "水质", "环境空气", "大气")):
+        return -1
+    score = 0
+    if any(word in text for word in ("声环境", "噪声", "声现状")):
+        score += 3
+    if "监测" in text:
+        score += 1
+    if "方案" in text or "布点" in text or "布设" in text:
+        score += 1
+    return score
 
 
 def normalize_plan_row(
@@ -186,24 +242,32 @@ def normalize_plan_row(
     defaults: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     defaults = defaults or {}
-    code = cell_value(row, "point_code", "监测点编号", "点位编号", "编号")
+    raw_code = cell_value(row, "point_code", "监测点编号", "点位编号", "编号")
+    code = extract_point_code(raw_code) or raw_code
+    raw_standard = cell_value(
+        row,
+        "standard_class",
+        "现状标准",
+        "现状执行标准",
+        "声现状执行标准",
+        "声环境现状执行标准",
+        "声环境标准",
+        "噪声执行标准",
+        "标准类别",
+        "执行标准",
+    )
+    standard_day, standard_night = parse_custom_noise_standard_limits(raw_standard)
     return {
         "point_code": code,
+        "code_detail": extract_code_detail(raw_code),
         "station": cell_value(row, "station", "桩号"),
         "point_name": cell_value(row, "point_name", "监测点名称", "敏感目标名称", "名称"),
         "district": cell_value(row, "district", "行政区划", "所在行政区"),
         "position": cell_value(row, "position", "监测点位置", "点位", "监测位置"),
-        "standard_class": cell_value(
-            row,
-            "standard_class",
-            "现状标准",
-            "现状执行标准",
-            "声现状执行标准",
-            "声环境现状执行标准",
-            "声环境标准",
-            "标准类别",
-            "执行标准",
-        ),
+        "standard_class": normalize_noise_standard_class(raw_standard),
+        "standard_class_raw": raw_standard,
+        "standard_day": standard_day,
+        "standard_night": standard_night,
         "factor": cell_value(row, "factor", "监测因子") or defaults.get("factor", ""),
         "frequency": cell_value(row, "frequency", "监测频次", "监测时间", "监测要求") or defaults.get("frequency", ""),
         "is_attenuation": is_attenuation_text(" ".join(str(v) for v in row.values())),
@@ -220,16 +284,251 @@ def cell_value(row: Dict[str, Any], *keys: str) -> str:
     return ""
 
 
+def normalize_noise_standard_class(value: Any) -> str:
+    text = re.sub(r"\s+", "", str(value or "")).lower()
+    if not text:
+        return ""
+    if parse_custom_noise_standard_limits(text) != (None, None):
+        return ""
+    text = text.replace("类区", "类")
+    match = re.search(r"(0|1|2|3|4a|4b|4|ⅰ|ⅱ|ⅲ|ⅳ|ⅴ|i{1,3}|iv|v)\s*类?", text, flags=re.IGNORECASE)
+    token = match.group(1) if match else text
+    mapping = {
+        "0": "0类",
+        "1": "1类",
+        "2": "2类",
+        "3": "3类",
+        "4": "4a类",
+        "4a": "4a类",
+        "4b": "4b类",
+        "ⅰ": "1类",
+        "ⅱ": "2类",
+        "ⅲ": "3类",
+        "ⅳ": "4a类",
+        "ⅴ": "4b类",
+        "i": "1类",
+        "ii": "2类",
+        "iii": "3类",
+        "iv": "4a类",
+        "v": "4b类",
+    }
+    if token in mapping:
+        return mapping[token]
+    return str(value or "").strip()
+
+
+def parse_custom_noise_standard_limits(value: Any) -> Tuple[Optional[int], Optional[int]]:
+    text = str(value or "")
+    match = re.search(r"(?<!\d)(\d{2,3})(?:\.0)?\s*/\s*(\d{2,3})(?:\.0)?(?!\d)", text)
+    if not match:
+        return None, None
+    return int(match.group(1)), int(match.group(2))
+
+
+def noise_standard_limits(plan: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+    custom_day = plan.get("standard_day")
+    custom_night = plan.get("standard_night")
+    if custom_day is not None and custom_night is not None:
+        return parse_int(custom_day), parse_int(custom_night)
+    standard_class = plan.get("standard_class")
+    return DAY_LIMITS.get(standard_class), NIGHT_LIMITS.get(standard_class)
+
+
+def noise_standard_display(plan: Dict[str, Any]) -> str:
+    custom_day, custom_night = noise_standard_limits(plan)
+    if plan.get("standard_day") is not None and plan.get("standard_night") is not None:
+        return f"{custom_day}/{custom_night}"
+    return str(plan.get("standard_class") or plan.get("standard_class_raw") or "").strip()
+
+
+def build_noise_standard_warnings(plan_rows: List[Dict[str, Any]]) -> List[str]:
+    warnings: List[str] = []
+    for row in plan_rows:
+        day_limit, night_limit = noise_standard_limits(row)
+        raw_standard = str(row.get("standard_class_raw") or row.get("standard_class") or "空").strip()
+        if day_limit is None or night_limit is None:
+            warnings.append(f"{row.get('point_code')} 未识别现状标准: {raw_standard}")
+        elif row.get("standard_day") is not None and row.get("standard_night") is not None:
+            warnings.append(f"{row.get('point_code')} 使用自定义昼/夜限值{day_limit}/{night_limit}，需复核")
+    return warnings
+
+
 def extract_noise_plan_defaults(chunks: List[Dict[str, Any]]) -> Dict[str, str]:
-    text = "\n".join(str(chunk.get("text") or "") for chunk in chunks if chunk.get("kind") == "paragraphs")
+    text = noise_plan_meta_source_text(chunks)
     defaults: Dict[str, str] = {}
-    factor_match = re.search(r"监测因子\s*[\r\n]+([^\r\n]+)", text)
-    if factor_match:
-        defaults["factor"] = factor_match.group(1).strip()
-    frequency_match = re.search(r"监测\s*2\s*天.*?昼间、夜间.*?各监测\s*1\s*次", text, flags=re.DOTALL)
-    if frequency_match:
-        defaults["frequency"] = "连续监测2天，每天昼间、夜间各监测1次，每次测量时间不低于20min。"
+    status: Dict[str, Any] = {
+        "rule": {},
+        "llm_status": "not_needed",
+        "warnings": [],
+        "final": {},
+    }
+
+    factor = extract_noise_factor_rule(text)
+    if factor:
+        defaults["factor"] = factor
+        status["rule"]["factor"] = factor
+    frequency = extract_noise_frequency_rule(text)
+    if frequency:
+        defaults["frequency"] = frequency
+        status["rule"]["frequency"] = frequency
+
+    missing = [
+        field
+        for field in ("factor", "frequency")
+        if not is_valid_noise_plan_meta(field, defaults.get(field, ""))
+    ]
+    if missing:
+        llm_defaults, llm_status = extract_noise_plan_defaults_with_llm(chunks, defaults, missing)
+        status.update(llm_status)
+        for field, value in llm_defaults.items():
+            if field in missing and is_valid_noise_plan_meta(field, value):
+                defaults[field] = value
+
+    for field in ("factor", "frequency"):
+        if not is_valid_noise_plan_meta(field, defaults.get(field, "")):
+            status["warnings"].append(
+                "监测因子未识别" if field == "factor" else "监测频次未识别"
+            )
+    status["final"] = {field: defaults.get(field, "") for field in ("factor", "frequency")}
+    write_json(DEBUG_DIR / "noise_plan_meta_status.json", status)
     return defaults
+
+
+def noise_plan_meta_source_text(chunks: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for chunk in chunks:
+        kind = chunk.get("kind")
+        if kind == "paragraphs":
+            parts.append(str(chunk.get("text") or ""))
+        elif kind == "table":
+            title = (chunk.get("metadata") or {}).get("table_title") or ""
+            if noise_plan_title_score(title) >= 0:
+                parts.append(str(title))
+                parts.append(str(chunk.get("text") or "")[:2000])
+    return "\n".join(part for part in parts if part).strip()
+
+
+def extract_noise_factor_rule(text: str) -> str:
+    patterns = [
+        r"(?:监测因子|监测项目)\s*[:：]?\s*([^\n。；;]+)",
+        r"(?:因子|项目)\s*[:：]\s*([^\n。；;]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text or "")
+        if match:
+            value = clean_plan_meta_value(match.group(1))
+            if is_valid_noise_plan_meta("factor", value):
+                return value
+    if re.search(r"等效连续\s*A\s*声级", text or "", flags=re.IGNORECASE):
+        return "等效连续A声级（LAeq）"
+    if re.search(r"\bLAeq\b", text or "", flags=re.IGNORECASE):
+        return "LAeq"
+    return ""
+
+
+def extract_noise_frequency_rule(text: str) -> str:
+    source = str(text or "")
+    if re.search(r"连续监测\s*2\s*天", source) and re.search(r"昼间[、,，和及]?夜间.*各监测\s*1\s*次", source, flags=re.DOTALL):
+        suffix = "，每次测量时间不低于20min" if re.search(r"20\s*min|20\s*分钟", source, flags=re.IGNORECASE) else ""
+        return f"连续监测2天，每天昼间、夜间各监测1次{suffix}。"
+    sentences = re.split(r"(?<=[。；;])|\n+", source)
+    candidates = []
+    for sentence in sentences:
+        value = clean_plan_meta_value(sentence)
+        if not value:
+            continue
+        if any(marker in value for marker in ("监测频次", "监测时间", "连续监测", "昼间", "夜间", "每次测量")):
+            candidates.append(value)
+    combined = "；".join(candidates[:3])
+    return combined if is_valid_noise_plan_meta("frequency", combined) else ""
+
+
+def clean_plan_meta_value(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" ：:;；。")
+    text = re.sub(r"^[:：]+", "", text).strip()
+    return text[:240]
+
+
+def is_valid_noise_plan_meta(field: str, value: str) -> bool:
+    text = str(value or "").strip()
+    if not text or text in {"-", "/", "无", "None", "none", "null"}:
+        return False
+    if re.search(r"\bN(?:J)?\d+(?:-\d+)?\b", text, flags=re.IGNORECASE):
+        return False
+    if field == "factor":
+        return len(text) >= 2 and len(text) <= 120
+    if field == "frequency":
+        return len(text) >= 6 and any(marker in text for marker in ("监测", "昼", "夜", "次", "天", "min", "分钟"))
+    return bool(text)
+
+
+def extract_noise_plan_defaults_with_llm(
+    chunks: List[Dict[str, Any]],
+    defaults: Dict[str, str],
+    missing: List[str],
+) -> Tuple[Dict[str, str], Dict[str, Any]]:
+    status: Dict[str, Any] = {
+        "llm_status": "not_needed",
+        "llm_missing_fields": missing,
+        "llm_error": None,
+        "warnings": [],
+    }
+    if not os.getenv("EIA_LLM_API_KEY"):
+        status["llm_status"] = "skipped_no_api_key"
+        status["warnings"].append("LLM方案元信息兜底跳过：未配置 API Key")
+        return {}, status
+
+    payload = {
+        "task": "extract_noise_plan_metadata",
+        "missing_fields": missing,
+        "existing_rule_values": defaults,
+        "constraints": [
+            "只提取监测方案中的监测因子和监测频次/监测时间。",
+            "不要提取或生成监测结果数值。",
+            "不要返回监测点位编号、点位名称或点位列表。",
+            "如果原文没有相关信息，对应字段返回空字符串。",
+        ],
+        "source_text": noise_plan_meta_source_text(chunks)[:5000],
+    }
+    write_json(DEBUG_DIR / "noise_plan_meta_llm_input.json", payload)
+    try:
+        result = chat_completion_json_object(
+            [
+                {"role": "system", "content": "Return strict JSON only."},
+                {
+                    "role": "user",
+                    "content": (
+                        "你是环评监测方案元信息抽取器。返回 JSON："
+                        "{\"factor\":\"\",\"frequency\":\"\",\"confidence\":0,\"warnings\":[]}。\n"
+                        + json.dumps(payload, ensure_ascii=False)
+                    ),
+                },
+            ],
+            profile=LlmProfile.fast,
+            max_retries=1,
+            max_tokens=700,
+            label="noise_plan_meta",
+        )
+        write_json(DEBUG_DIR / "noise_plan_meta_llm_output.json", result)
+        accepted: Dict[str, str] = {}
+        for field in ("factor", "frequency"):
+            value = clean_plan_meta_value(str(result.get(field) or ""))
+            if field in missing and is_valid_noise_plan_meta(field, value):
+                accepted[field] = value
+            elif field in missing and value:
+                status["warnings"].append(
+                    f"LLM方案元信息兜底结果未通过校验: {field}={value}"
+                )
+        status["llm_status"] = "success" if accepted else "validation_failed"
+        status["llm_confidence"] = result.get("confidence")
+        if isinstance(result.get("warnings"), list):
+            status["warnings"].extend(str(item) for item in result.get("warnings") if item)
+        return accepted, status
+    except Exception as exc:
+        status["llm_status"] = "failed"
+        status["llm_error"] = str(exc)
+        status["warnings"].append(f"LLM方案元信息兜底失败: {exc}")
+        return {}, status
 
 
 def load_flattened_noise(filename: str, noise_type: str) -> List[Dict[str, Any]]:
@@ -237,7 +536,7 @@ def load_flattened_noise(filename: str, noise_type: str) -> List[Dict[str, Any]]
     if not path.exists():
         raise FileNotFoundError(f"缺少噪声扁平化表: {path}")
     data = json.loads(path.read_text(encoding="utf-8"))
-    return parse_flattened_noise_records(data, noise_type)
+    return parse_flattened_noise_records(data, noise_type, table_order=flattened_table_sort_key(path)[0])
 
 
 def load_available_flattened_noise() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -248,7 +547,7 @@ def load_available_flattened_noise() -> Tuple[List[Dict[str, Any]], List[Dict[st
     for path in paths:
         data = json.loads(path.read_text(encoding="utf-8"))
         noise_type = infer_flattened_noise_type(data)
-        records = parse_flattened_noise_records(data, noise_type)
+        records = parse_flattened_noise_records(data, noise_type, table_order=flattened_table_sort_key(path)[0])
         debug_items.append(
             {
                 "file": path.name,
@@ -282,13 +581,15 @@ def infer_flattened_noise_type(data: Dict[str, Any]) -> str:
         ),
     ]
     text = "\n".join(text_parts)
+    if "铁路边界噪声" in text or "列车流量" in text:
+        return "railway_boundary_noise"
     traffic_markers = ("交通噪声", "车流量", "衰减断面", "交通量", "距路")
     if any(marker in text for marker in traffic_markers):
         return "traffic_noise"
     return "area_environment_noise"
 
 
-def parse_flattened_noise_records(data: Dict[str, Any], noise_type: str) -> List[Dict[str, Any]]:
+def parse_flattened_noise_records(data: Dict[str, Any], noise_type: str, table_order: int = 9999) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     raw_records = data.get("records") or []
     headers = list(data.get("flattened_headers") or [])
@@ -311,6 +612,8 @@ def parse_flattened_noise_records(data: Dict[str, Any], noise_type: str) -> List
     time_key = mapping.get("monitor_time") or TIME_KEY
     mapped_laeq_key = mapping.get("laeq")
     flow_key = mapping.get("traffic_flow") or FLOW_KEY
+    flow_unit = flow_label_from_header(flow_key)
+    factor_items = noise_factor_items_from_headers(headers)
     for index, row in enumerate(raw_records):
         point_text = str(row.get(point_key) or "").strip()
         laeq_key = mapped_laeq_key or next((key for key in row if key.endswith("_LAeq")), None)
@@ -327,12 +630,82 @@ def parse_flattened_noise_records(data: Dict[str, Any], noise_type: str) -> List
                 "monitor_time": row.get(time_key) or "",
                 "period": infer_period(row.get(time_key) or ""),
                 "laeq": row.get(laeq_key),
+                "laeq_key": laeq_key,
                 "traffic_flow": row.get(flow_key) or "/",
+                "traffic_flow_unit": flow_unit,
+                "noise_factor_items": factor_items,
+                "source_headers": headers,
+                "source_table_order": table_order,
                 "source_order": index,
                 "raw": row,
             }
         )
     return records
+
+
+def apply_noise_result_meta_to_plan_rows(plan_rows: List[Dict[str, Any]], records: List[Dict[str, Any]]) -> None:
+    factor = infer_noise_factor_from_records(records)
+    frequency = compact_noise_frequency(next((row.get("frequency") for row in plan_rows if row.get("frequency")), ""))
+    status_path = DEBUG_DIR / "noise_plan_meta_status.json"
+    status = read_json(status_path) if status_path.exists() else {}
+    status.setdefault("result_header_rule", {})
+    if factor:
+        status["result_header_rule"]["factor"] = factor
+    if frequency:
+        status["result_header_rule"]["frequency"] = frequency
+    for row in plan_rows:
+        if factor:
+            row["factor"] = factor
+        if frequency:
+            row["frequency"] = frequency
+    status["final"] = {
+        "factor": factor or next((row.get("factor") for row in plan_rows if row.get("factor")), ""),
+        "frequency": frequency or next((row.get("frequency") for row in plan_rows if row.get("frequency")), ""),
+    }
+    write_json(DEBUG_DIR / "noise_plan_meta_status.json", status)
+
+
+def infer_noise_factor_from_records(records: List[Dict[str, Any]]) -> str:
+    preferred = ["LAeq", "L10", "L50", "L90", "Lmax", "Lmin"]
+    found = []
+    for record in records:
+        for item in record.get("noise_factor_items") or []:
+            if item not in found:
+                found.append(item)
+    ordered = [item for item in preferred if item in found]
+    return "、".join(ordered or found)
+
+
+def noise_factor_items_from_headers(headers: List[str]) -> List[str]:
+    items: List[str] = []
+    for header in headers:
+        text = str(header or "")
+        for item in ("LAeq", "L10", "L50", "L90", "Lmax", "Lmin"):
+            if re.search(rf"(?<![A-Za-z0-9]){re.escape(item)}(?![A-Za-z0-9])", text, flags=re.IGNORECASE):
+                canonical = item
+                if canonical not in items:
+                    items.append(canonical)
+    return items
+
+
+def compact_noise_frequency(value: str) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    if "列车" in text or "铁路" in text:
+        return "监测2天，昼、夜间各监测1次；铁路边界噪声每次不小于1h，区域环境噪声每次60min。"
+    if re.search(r"连续监测\s*2\s*天|监测\s*2\s*天", text) and re.search(r"昼.*夜|夜.*昼", text):
+        return "监测2天，昼、夜间各监测1次。"
+    if len(text) > 80:
+        return text[:80].rstrip("，,；;。") + "。"
+    return text
+
+
+def flow_label_from_header(header: str) -> str:
+    text = str(header or "").strip()
+    if not text or text == FLOW_KEY:
+        return "车流量（辆/20min）"
+    return text
 
 
 def has_noise_point_identity(text: str) -> bool:
@@ -342,25 +715,46 @@ def has_noise_point_identity(text: str) -> bool:
     return any(marker in value for marker in ("点位编号", "敏感点", "背景点", "衰减断面"))
 
 
-def build_monitor_points_table(plan_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def build_monitor_points_table(plan_rows: List[Dict[str, Any]], records: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     headers = ["监测点编号", "桩号", "监测点名称", "行政区划", "监测点位置", "现状标准", "监测因子", "监测频次"]
-    rows = [
-        {
-            "监测点编号": row["point_code"],
-            "桩号": row["station"],
-            "监测点名称": row["point_name"],
-            "行政区划": row["district"],
-            "监测点位置": row["position"],
-            "现状标准": row["standard_class"],
-            "监测因子": row["factor"],
-            "监测频次": row["frequency"],
-        }
-        for row in plan_rows
-    ]
+    plan_records = first_record_by_plan_row(records or [], plan_rows)
+    rows = []
+    debug_rows = []
+    for row in plan_rows:
+        record = plan_records.get(id(row))
+        final_name = monitor_point_display_name(row, record)
+        final_position = monitor_point_display_position(row, record)
+        rows.append(
+            {
+                "监测点编号": row["point_code"],
+                "桩号": row["station"],
+                "监测点名称": final_name,
+                "行政区划": row["district"],
+                "监测点位置": final_position,
+                "现状标准": noise_standard_display(row),
+                "监测因子": row["factor"],
+                "监测频次": row["frequency"],
+            }
+        )
+        debug_rows.append(
+            {
+                "point_code": row.get("point_code"),
+                "raw_plan_name": row.get("point_name"),
+                "raw_plan_position": row.get("position"),
+                "raw_report_point": (record or {}).get("point_text"),
+                "final_name": final_name,
+                "final_position": final_position,
+            }
+        )
     if not any(str(row.get("行政区划") or "").strip() for row in rows):
         headers = [header for header in headers if header != "行政区划"]
         for row in rows:
             row.pop("行政区划", None)
+    if all(is_blank_table_value(row.get("桩号")) for row in rows):
+        headers = [header for header in headers if header != "桩号"]
+        for row in rows:
+            row.pop("桩号", None)
+    write_json(DEBUG_DIR / "noise_monitor_points_name_position_debug.json", debug_rows)
     return {
         "table_key": NOISE_TABLE_MONITOR_POINTS,
         "caption_suffix": "声环境质量现状监测点",
@@ -370,21 +764,245 @@ def build_monitor_points_table(plan_rows: List[Dict[str, Any]]) -> Dict[str, Any
     }
 
 
+def first_record_by_plan_row(records: List[Dict[str, Any]], plan_rows: List[Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+    if not records:
+        return {}
+    plan_row_ids = {id(row) for row in plan_rows}
+    result: Dict[int, Dict[str, Any]] = {}
+    for record in match_records(records, plan_rows):
+        plan = record.get("plan") or {}
+        plan_id = id(plan)
+        if plan_id not in plan_row_ids or plan_id in result:
+            continue
+        result[plan_id] = record
+    return result
+
+
+def monitor_point_display_name(plan: Dict[str, Any], record: Optional[Dict[str, Any]]) -> str:
+    if plan.get("is_attenuation"):
+        return clean_attenuation_point_name(plan, record)
+    candidates = [
+        str(plan.get("point_name") or ""),
+        str((record or {}).get("point_text") or ""),
+    ]
+    detail = str(plan.get("code_detail") or "").strip()
+    if detail:
+        candidates.insert(0, f"{plan.get('point_name') or ''}{detail}")
+    for candidate in candidates:
+        name = clean_monitor_point_object_name(candidate, plan, record)
+        if name:
+            return name
+    return "-"
+
+
+def monitor_point_display_position(plan: Dict[str, Any], record: Optional[Dict[str, Any]]) -> str:
+    if plan.get("is_attenuation"):
+        return clean_attenuation_point_position(plan, record)
+    report_position = ""
+    if record:
+        _name, report_position = split_monitor_point_identity(record.get("point_text"), plan, record)
+    plan_position = str(plan.get("position") or "").strip()
+    position = build_monitor_point_position(plan_position, report_position)
+    if position:
+        return position
+    if re.fullmatch(r"\d+", plan_position):
+        return f"{plan_position}层"
+    return first_floor_position_from_plan(plan_position) or plan_position or "-"
+
+
+def clean_monitor_point_object_name(
+    value: Any,
+    plan: Dict[str, Any],
+    record: Optional[Dict[str, Any]] = None,
+) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    raw_code = str((record or {}).get("raw_point_code") or plan.get("point_code") or "").strip()
+    station = str(plan.get("station") or "").strip()
+    for token in (raw_code, raw_code.replace("NJ", "N", 1) if raw_code.startswith("NJ") else ""):
+        if token:
+            text = re.sub(rf"(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9-])", "", text, flags=re.IGNORECASE)
+    if station:
+        text = text.replace(station, "")
+    text = re.sub(r"K\s*\d+\s*[+-]\s*\d+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"点位编号\s*[A-Za-z]*\d+(?:-\d+)?", "", text, flags=re.IGNORECASE)
+    text = re.split(r"(?:面向|背向|距离|距|首排|第二排|道路红线|道路中心线|公路中心线|铁路|陇海线)", text, maxsplit=1)[0]
+    text = re.sub(r"\d+(?:\.\d+)?\s*m", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\d+\s*[层楼](?:室外|室内)?(?:监测)?", "", text)
+    text = re.sub(r"(?:室外|室内)\s*(?:监测|噪声监测)?", "", text)
+    text = re.sub(r"(?:敏感点|背景点|噪声监测|监测点)", "", text)
+    text = re.sub(r"\s+", "", text).strip("、，,;；。()（）")
+    text = re.sub(r"(?<=[\u4e00-\u9fff])(\d+)$", r" \1", text)
+    return text.strip()
+
+
+def build_monitor_point_position(plan_position: str, report_position: str) -> str:
+    plan_text = str(plan_position or "").strip()
+    report_text = str(report_position or "").strip()
+    for source in (report_text, plan_text):
+        if has_orientation_marker(source) and re.search(r"\d+\s*[层楼]", source):
+            return normalize_display_position(source)
+    orientation = extract_orientation_context(report_text) or extract_orientation_context(plan_text)
+    floor = extract_floor_position_fragment(report_text) or first_floor_position_from_plan(plan_text)
+    if orientation and floor:
+        return f"{orientation} {floor}"
+    if orientation:
+        return orientation
+    if floor:
+        return floor
+    return normalize_display_position(report_text or plan_text)
+
+
+def extract_orientation_context(text: str) -> str:
+    value = str(text or "")
+    match = re.search(
+        r"(面向[^，,；;。]*?(?:首排|第二排|本项目|道路|公路|铁路)|背向[^，,；;。]*?(?:首排|第二排|本项目|道路|公路|铁路))",
+        value,
+    )
+    if match:
+        result = re.sub(r"\d+\s*[层楼](?:室外|室内)?(?:监测)?", "", match.group(1))
+        result = re.sub(r"\s+", "", result).strip("、，,;；。")
+        return result
+    if "首排" in value:
+        return "面向本项目首排" if "本项目" in value or "面向" in value else "首排"
+    return ""
+
+
+def normalize_display_position(text: str) -> str:
+    value = normalize_position_text(str(text or ""))
+    value = re.sub(r"\s+", "", value).strip("、，,;；。")
+    value = re.sub(r"(面向[^，,；;。]*?)(\d+\s*[层楼])", r"\1 \2", value)
+    return value
+
+
+def clean_attenuation_point_name(plan: Dict[str, Any], record: Optional[Dict[str, Any]]) -> str:
+    for source in (plan.get("point_name"), (record or {}).get("point_text"), plan.get("position")):
+        text = str(source or "").strip()
+        if not text:
+            continue
+        text = re.sub(r"K\s*\d+\s*[+-]\s*\d+", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"N(?:J)?\d+(?:-\d+)?", "", text, flags=re.IGNORECASE)
+        match = re.search(r"([^，,；;。]*断面)", text)
+        if match:
+            name = clean_monitor_point_object_name(match.group(1), plan, record)
+            return name or "衰减断面"
+    return "衰减断面"
+
+
+def clean_attenuation_point_position(plan: Dict[str, Any], record: Optional[Dict[str, Any]]) -> str:
+    raw_code = str((record or {}).get("raw_point_code") or plan.get("point_code") or "").strip()
+    station = str(plan.get("station") or "").strip()
+    point_name = str(plan.get("point_name") or "").strip()
+    for source in ((record or {}).get("point_text"), plan.get("position")):
+        text = clean_attenuation_position_text(source, raw_code, station, point_name)
+        if text:
+            return text
+    fallback = strip_point_identity(str(plan.get("position") or ""), raw_code, station, point_name)
+    fallback = re.sub(r"点位编号\s*[A-Za-z]*\d+(?:-\d+)?", "", fallback, flags=re.IGNORECASE)
+    fallback = re.sub(r"N(?:J)?\d+(?:-\d+)?", "", fallback, flags=re.IGNORECASE)
+    return re.sub(r"\s+", "", fallback).strip("、，,;；。") or "-"
+
+
+def clean_attenuation_position_text(value: Any, raw_code: str, station: str, point_name: str) -> str:
+    text = strip_point_identity(str(value or ""), raw_code, station, point_name)
+    text = re.sub(r"点位编号\s*[A-Za-z]*\d+(?:-\d+)?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"N(?:J)?\d+(?:-\d+)?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"K\s*\d+\s*[+-]\s*\d+", "", text, flags=re.IGNORECASE)
+    match = re.search(
+        r"((?:距离|距)[^，,；;。]*?\d+(?:\.\d+)?\s*m[^，,；;。]*)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    return re.sub(r"\s+", "", match.group(1)).strip("、，,;；。")
+
+
+def clean_result_table_point_name(record: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    for source in (plan.get("point_name"), record.get("point_text"), result_name_for_record(record, plan)):
+        name = clean_monitor_point_object_name(source, plan, record)
+        if name:
+            return name
+    return "-"
+
+
+def split_monitor_point_identity(
+    point_text: Any,
+    plan: Dict[str, Any],
+    record: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    text = str(point_text or "").strip()
+    if not text:
+        return "", ""
+    raw_code = str((record or {}).get("raw_point_code") or "").strip()
+    text = strip_noise_point_code_prefix(text, raw_code)
+    position = extract_floor_position_fragment(text)
+    name = text
+    if position:
+        name = re.sub(rf"{re.escape(position)}\s*$", "", name)
+    name = sanitize_result_point_name(name, {**plan, "position": ""})
+    if not name:
+        name = monitor_point_display_name({**plan, "code_detail": ""}, None)
+    return name, position
+
+
+def strip_noise_point_code_prefix(text: str, raw_code: str = "") -> str:
+    result = str(text or "").strip()
+    if raw_code:
+        n_code = raw_code.replace("NJ", "N", 1)
+        result = re.sub(rf"^\s*(?:{re.escape(raw_code)}|{re.escape(n_code)})\s*", "", result, flags=re.IGNORECASE)
+    result = re.sub(r"^\s*N(?:J)?\d+(?:-\d+)?\s*", "", result, flags=re.IGNORECASE)
+    return result.strip()
+
+
 def build_sensitive_result_table(
     records: List[Dict[str, Any]],
     plan_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    subtables: List[Dict[str, Any]] = []
+    all_rows: List[Dict[str, Any]] = []
+    all_warnings: List[str] = []
+    type_groups = [
+        ("railway_boundary_noise", {"railway_boundary_noise"}),
+        ("area_traffic_noise", {"traffic_noise", "area_environment_noise"}),
+    ]
+    for noise_type, source_types in type_groups:
+        type_records = [record for record in records if record.get("noise_type") in source_types]
+        if not type_records:
+            continue
+        subtable = build_sensitive_result_subtable(type_records, plan_rows, noise_type)
+        if subtable.get("rows"):
+            subtables.append(subtable)
+            all_rows.extend(subtable["rows"])
+            all_warnings.extend(subtable.get("warnings") or [])
+    if not subtables:
+        subtable = build_sensitive_result_subtable(records, plan_rows, "area_environment_noise")
+        subtables.append(subtable)
+        all_rows.extend(subtable.get("rows") or [])
+        all_warnings.extend(subtable.get("warnings") or [])
+    return {
+        "table_key": NOISE_TABLE_SENSITIVE,
+        "caption_suffix": "项目沿线敏感点声环境现状监测平均值  单位：dB(A)",
+        "title": "项目沿线敏感点声环境现状监测平均值  单位：dB(A)",
+        "headers": result_headers(include_flow=has_traffic_flow(all_rows)),
+        "rows": all_rows,
+        "subtables": subtables,
+        "flow_label": flow_label_from_rows(all_rows),
+        "warnings": all_warnings,
+    }
+
+
+def build_sensitive_result_subtable(
+    records: List[Dict[str, Any]],
+    plan_rows: List[Dict[str, Any]],
+    noise_type: str,
 ) -> Dict[str, Any]:
     matched = match_records(records, plan_rows)
     grouped = group_sensitive_records_for_result(matched)
     rows: List[Dict[str, Any]] = []
     warnings: List[str] = []
-    for plan in sorted(
-        [row for row in plan_rows if not row.get("is_attenuation")],
-        key=lambda row: point_sort_key(row["point_code"]),
-    ):
-        code = plan["point_code"]
-        if not any((group["plan"].get("source_plan_code") or group["plan"].get("point_code")) == code for group in grouped.values()):
-            raise ValueError(f"监测方案点位 {code} 未在噪声监测结果中匹配到数据")
+    debug_rows: List[Dict[str, Any]] = []
     for code in sorted(grouped, key=point_sort_key):
         plan = grouped[code]["plan"]
         if plan.get("is_attenuation"):
@@ -398,23 +1016,40 @@ def build_sensitive_result_table(
         row["traffic_flow_day1_night"] = flow_text(flows, 0, "night")
         row["traffic_flow_day2_day"] = flow_text(flows, 1, "day")
         row["traffic_flow_day2_night"] = flow_text(flows, 1, "night")
+        row["_flow_label"] = flow_label_from_records(point_records)
+        row["noise_type"] = noise_type
+        row["noise_type_label"] = noise_type_label(noise_type)
         row["noise_types"] = sorted({record["noise_type"] for record in point_records})
         row["needs_review"] = bool(metrics.get("warnings"))
         row["warning"] = "；".join(metrics.get("warnings") or [])
         rows.append(row)
         warnings.extend(metrics.get("warnings") or [])
+        debug_rows.append(result_name_position_debug_item(plan, point_records, noise_type_label(noise_type)))
     include_flow = has_traffic_flow(rows)
     if not include_flow:
         strip_traffic_flow_fields(rows)
     headers = result_headers(include_flow=include_flow)
     return {
-        "table_key": NOISE_TABLE_SENSITIVE,
-        "caption_suffix": "项目沿线敏感点声环境现状监测平均值  单位：dB(A)",
-        "title": "项目沿线敏感点声环境现状监测平均值  单位：dB(A)",
+        "table_key": f"{NOISE_TABLE_SENSITIVE}_{noise_type}",
+        "caption_suffix": f"{noise_type_label(noise_type)}监测结果  单位：dB(A)",
+        "title": f"{noise_type_label(noise_type)}监测结果  单位：dB(A)",
+        "noise_type": noise_type,
+        "noise_type_label": noise_type_label(noise_type),
         "headers": headers,
         "rows": rows,
+        "flow_label": flow_label_from_rows(rows),
         "warnings": warnings,
+        "name_position_debug": debug_rows,
     }
+
+
+def noise_type_label(noise_type: str) -> str:
+    return {
+        "railway_boundary_noise": "铁路边界噪声",
+        "traffic_noise": "交通噪声",
+        "area_environment_noise": "区域环境噪声",
+        "area_traffic_noise": "区域环境及交通噪声",
+    }.get(noise_type, "声环境噪声")
 
 
 def build_attenuation_result_table(
@@ -425,6 +1060,7 @@ def build_attenuation_result_table(
     grouped = group_records_by_point(matched)
     rows: List[Dict[str, Any]] = []
     warnings: List[str] = []
+    debug_rows: List[Dict[str, Any]] = []
     for code in sorted(grouped, key=point_sort_key):
         plan = grouped[code]["plan"]
         if not plan.get("is_attenuation"):
@@ -439,10 +1075,12 @@ def build_attenuation_result_table(
         row["traffic_flow_day1_night"] = flow_text(flows, 0, "night")
         row["traffic_flow_day2_day"] = flow_text(flows, 1, "day")
         row["traffic_flow_day2_night"] = flow_text(flows, 1, "night")
+        row["_flow_label"] = flow_label_from_records(point_records)
         row["needs_review"] = bool(metrics.get("warnings"))
         row["warning"] = "；".join(metrics.get("warnings") or [])
         rows.append(row)
         warnings.extend(metrics.get("warnings") or [])
+        debug_rows.append(result_name_position_debug_item(plan, point_records, "交通噪声衰减断面"))
     include_flow = has_traffic_flow(rows)
     if not include_flow:
         strip_traffic_flow_fields(rows)
@@ -453,24 +1091,113 @@ def build_attenuation_result_table(
         "title": "现状公路交通噪声衰减断面监测结果  单位：dB(A)",
         "headers": headers,
         "rows": rows,
+        "flow_label": flow_label_from_rows(rows),
         "warnings": warnings,
+        "name_position_debug": debug_rows,
     }
+
+
+def result_name_position_debug_item(plan: Dict[str, Any], records: List[Dict[str, Any]], table_label: str) -> Dict[str, Any]:
+    first_record = records[0] if records else {}
+    marker, marker_source = record_indoor_outdoor_marker(first_record, plan)
+    return {
+        "table": table_label,
+        "point_code": plan.get("point_code"),
+        "raw_plan_name": plan.get("point_name"),
+        "raw_plan_position": plan.get("position"),
+        "raw_report_point": first_record.get("point_text"),
+        "source_headers": first_record.get("source_headers") or [],
+        "noise_type": first_record.get("noise_type"),
+        "final_name": plan.get("point_name"),
+        "final_position": plan.get("position"),
+        "indoor_outdoor_marker": marker,
+        "indoor_outdoor_source": marker_source,
+    }
+
+
+def collect_result_name_position_debug(table2: Dict[str, Any], table3: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for subtable in table2.get("subtables") or []:
+        items.extend(subtable.get("name_position_debug") or [])
+    items.extend(table3.get("name_position_debug") or [])
+    return items
+
+
+def is_blank_table_value(value: Any) -> bool:
+    return str(value or "").strip() in {"", "-", "/", "—", "无", "None", "none", "null"}
+
+
+def build_noise_plan_meta_warnings(plan_rows: List[Dict[str, Any]]) -> List[str]:
+    warnings: List[str] = []
+    if any(not is_valid_noise_plan_meta("factor", row.get("factor", "")) for row in plan_rows):
+        warnings.append("监测因子未识别")
+    if any(not is_valid_noise_plan_meta("frequency", row.get("frequency", "")) for row in plan_rows):
+        warnings.append("监测频次未识别")
+    status_path = DEBUG_DIR / "noise_plan_meta_status.json"
+    if status_path.exists():
+        try:
+            status = read_json(status_path)
+            for warning in status.get("warnings") or []:
+                warning_text = str(warning or "").strip()
+                if warning_text and warning_text not in warnings:
+                    warnings.append(warning_text)
+        except Exception:
+            pass
+    return warnings
 
 
 def build_indoor_result_table(table2: Dict[str, Any]) -> Dict[str, Any]:
     indoor_rows: List[Dict[str, Any]] = []
-    outdoor_rows: List[Dict[str, Any]] = []
-    for row in table2.get("rows") or []:
-        if is_indoor_result_row(row):
-            indoor_rows.append(row)
-        else:
-            outdoor_rows.append(row)
+    outdoor_subtables: List[Dict[str, Any]] = []
+    outdoor_rows_all: List[Dict[str, Any]] = []
+    outdoor_warnings: List[str] = []
+    source_subtables = table2.get("subtables") or [
+        {
+            "table_key": table2.get("table_key", NOISE_TABLE_SENSITIVE),
+            "caption_suffix": table2.get("caption_suffix", ""),
+            "title": table2.get("title", ""),
+            "noise_type": table2.get("noise_type"),
+            "noise_type_label": table2.get("noise_type_label"),
+            "headers": table2.get("headers") or [],
+            "rows": table2.get("rows") or [],
+            "flow_label": table2.get("flow_label", ""),
+            "warnings": table2.get("warnings") or [],
+            "name_position_debug": table2.get("name_position_debug") or [],
+        }
+    ]
+    for subtable in source_subtables:
+        subtable_outdoor_rows: List[Dict[str, Any]] = []
+        for row in subtable.get("rows") or []:
+            if is_indoor_result_row(row):
+                indoor_rows.append(row)
+            else:
+                subtable_outdoor_rows.append(row)
+        if not subtable_outdoor_rows:
+            continue
+        include_subtable_flow = has_traffic_flow(subtable_outdoor_rows)
+        if not include_subtable_flow:
+            strip_traffic_flow_fields(subtable_outdoor_rows)
+        updated_subtable = dict(subtable)
+        updated_subtable["rows"] = subtable_outdoor_rows
+        updated_subtable["headers"] = result_headers(include_flow=include_subtable_flow)
+        updated_subtable["flow_label"] = flow_label_from_rows(subtable_outdoor_rows)
+        updated_subtable["warnings"] = [
+            warning
+            for row in subtable_outdoor_rows
+            for warning in (row.get("warnings") or [])
+        ]
+        outdoor_subtables.append(updated_subtable)
+        outdoor_rows_all.extend(subtable_outdoor_rows)
+        outdoor_warnings.extend(updated_subtable["warnings"])
 
-    table2["rows"] = outdoor_rows
-    include_flow = has_traffic_flow(outdoor_rows)
+    table2["subtables"] = outdoor_subtables
+    table2["rows"] = outdoor_rows_all
+    include_flow = has_traffic_flow(outdoor_rows_all)
     if not include_flow:
-        strip_traffic_flow_fields(outdoor_rows)
+        strip_traffic_flow_fields(outdoor_rows_all)
     table2["headers"] = result_headers(include_flow=include_flow)
+    table2["flow_label"] = flow_label_from_rows(outdoor_rows_all)
+    table2["warnings"] = outdoor_warnings
 
     include_indoor_flow = has_traffic_flow(indoor_rows)
     if not include_indoor_flow:
@@ -481,12 +1208,55 @@ def build_indoor_result_table(table2: Dict[str, Any]) -> Dict[str, Any]:
         "title": "室内噪声监测结果统计  单位：dB(A)",
         "headers": result_headers(include_flow=include_indoor_flow),
         "rows": indoor_rows,
+        "flow_label": flow_label_from_rows(indoor_rows),
         "warnings": [
             warning
             for row in indoor_rows
             for warning in (row.get("warnings") or [])
         ],
     }
+
+
+def flow_label_from_records(records: List[Dict[str, Any]]) -> str:
+    labels = []
+    for record in records:
+        value = str(record.get("traffic_flow") or "").strip()
+        label = str(record.get("traffic_flow_unit") or "").strip()
+        if value and value not in {"-", "/", "—", "无", "None", "none", "null"} and label and label not in labels:
+            labels.append(label)
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) > 1:
+        return "交通量"
+    return ""
+
+
+def flow_label_from_rows(rows: List[Dict[str, Any]]) -> str:
+    labels = []
+    for row in rows:
+        label = str(row.get("_flow_label") or "").strip()
+        if label and label not in labels:
+            labels.append(label)
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) > 1:
+        return "交通量"
+    return "车流量（辆/20min）"
+
+
+def build_flow_unit_warnings(records: List[Dict[str, Any]]) -> List[str]:
+    labels = sorted(
+        {
+            str(record.get("traffic_flow_unit") or "").strip()
+            for record in records
+            if str(record.get("traffic_flow") or "").strip() not in {"", "-", "/", "—", "无", "None", "none", "null"}
+            and str(record.get("traffic_flow_unit") or "").strip()
+        }
+    )
+    write_json(DEBUG_DIR / "noise_flow_unit_status.json", {"labels": labels})
+    if len(labels) > 1:
+        return ["噪声监测结果存在多个交通量单位: " + "、".join(labels)]
+    return []
 
 
 def is_indoor_result_row(row: Dict[str, Any]) -> bool:
@@ -559,13 +1329,36 @@ def match_records(records: List[Dict[str, Any]], plan_rows: List[Dict[str, Any]]
     return result
 
 
-def validate_plan_report_match(records: List[Dict[str, Any]], plan_rows: List[Dict[str, Any]]) -> None:
+def validate_plan_report_match(records: List[Dict[str, Any]], plan_rows: List[Dict[str, Any]]) -> List[str]:
     matched = match_records(records, plan_rows)
-    grouped = group_records_by_point(matched)
-    plan_codes = {row["point_code"] for row in plan_rows}
-    report_codes = set(grouped)
-    missing_in_report = sorted(plan_codes - report_codes, key=point_sort_key)
-    extra_in_report = sorted(report_codes - plan_codes, key=point_sort_key)
+    plan_row_ids = {id(row) for row in plan_rows}
+    matched_plan_ids = {
+        id(record.get("plan"))
+        for record in matched
+        if id(record.get("plan")) in plan_row_ids
+    }
+    missing_plan_rows = [
+        {
+            "point_code": row.get("point_code"),
+            "point_name": row.get("point_name"),
+            "position": row.get("position"),
+            "standard_class": row.get("standard_class"),
+        }
+        for row in plan_rows
+        if id(row) not in matched_plan_ids
+    ]
+    missing_in_report = sorted(
+        {str(row.get("point_code") or "") for row in missing_plan_rows if row.get("point_code")},
+        key=point_sort_key,
+    )
+    extra_in_report = sorted(
+        {
+            str(record.get("raw_point_code") or record.get("point_text") or "")
+            for record in matched
+            if id(record.get("plan")) not in plan_row_ids
+        },
+        key=point_sort_key,
+    )
     unmatched_records = [
         {
             "point_text": record.get("point_text"),
@@ -573,21 +1366,29 @@ def validate_plan_report_match(records: List[Dict[str, Any]], plan_rows: List[Di
             "noise_type": record.get("noise_type"),
         }
         for record in matched
-        if not (record.get("plan") or {}).get("point_code")
+        if id(record.get("plan")) not in plan_row_ids
     ]
     payload = {
         "missing_in_report": missing_in_report,
+        "missing_plan_rows": missing_plan_rows,
         "extra_in_report": extra_in_report,
         "unmatched_records": unmatched_records,
-        "plan_count": len(plan_codes),
-        "report_count": len(report_codes),
+        "plan_count": len(plan_rows),
+        "matched_plan_count": len(matched_plan_ids),
+        "report_record_count": len(records),
     }
     write_json(DEBUG_DIR / "noise_plan_report_mismatch.json", payload)
-    if missing_in_report or extra_in_report or unmatched_records:
-        raise ValueError(
-            "监测方案与监测报告噪声点位不一致，详见 "
-            f"{(DEBUG_DIR / 'noise_plan_report_mismatch.json').resolve()}"
+    warnings: List[str] = []
+    for row in missing_plan_rows:
+        warnings.append(
+            f"监测方案点位{row.get('point_code')}（{row.get('point_name')}，{row.get('position')}）"
+            "未在噪声监测报告中匹配到对应数据"
         )
+    for record in unmatched_records:
+        warnings.append(
+            f"噪声监测报告点位{record.get('raw_point_code') or record.get('point_text')}未匹配到监测方案"
+        )
+    return warnings
 
 
 def build_plan_report_position_warnings(
@@ -645,6 +1446,13 @@ def match_plan(record: Dict[str, Any], plan_rows: List[Dict[str, Any]]) -> Dict[
     if background_plan:
         return background_plan
     if raw_code:
+        by_detail_position = match_plan_by_floor_position(
+            point_text,
+            related_plan_candidates(raw_code, plan_rows),
+            require_detail_match=True,
+        )
+        if by_detail_position:
+            return by_detail_position
         candidates = [row for row in plan_rows if row["point_code"] == raw_code]
         if len(candidates) == 1:
             return candidates[0]
@@ -733,26 +1541,57 @@ def related_plan_candidates(raw_code: str, plan_rows: List[Dict[str, Any]]) -> L
     ]
 
 
-def match_plan_by_floor_position(point_text: str, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def match_plan_by_floor_position(
+    point_text: str,
+    candidates: List[Dict[str, Any]],
+    require_detail_match: bool = False,
+) -> Optional[Dict[str, Any]]:
     point_floors = floor_tokens(point_text)
     if not point_floors or not candidates:
         return None
-    scored: List[Tuple[int, int, Dict[str, Any]]] = []
+    scored: List[Tuple[int, int, int, Dict[str, Any]]] = []
+    any_detail_match = any(plan_detail_matches_point_text(row, point_text) for row in candidates)
     for row in candidates:
+        detail_match = plan_detail_matches_point_text(row, point_text)
+        if require_detail_match and not detail_match:
+            continue
+        if any_detail_match and row.get("code_detail") and not detail_match:
+            continue
         row_floors = floor_tokens(str(row.get("position") or ""))
         score = len(point_floors & row_floors)
         if score:
-            scored.append((score, -len(row_floors), row))
+            scored.append((score, 1 if detail_match else 0, -len(row_floors), row))
     if not scored:
         return None
-    scored.sort(key=lambda item: (item[0], item[1], point_sort_key(item[2].get("point_code"))), reverse=True)
-    return scored[0][2]
+    scored.sort(key=lambda item: (item[0], item[1], item[2], point_sort_key(item[3].get("point_code"))), reverse=True)
+    return scored[0][3]
+
+
+def extract_code_detail(text: str) -> str:
+    value = str(text or "")
+    match = re.search(r"[（(]\s*([^）)]+?)\s*[）)]", value)
+    return normalize_plan_detail(match.group(1)) if match else ""
+
+
+def normalize_plan_detail(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or "").strip())
+
+
+def plan_detail_matches_point_text(row: Dict[str, Any], point_text: str) -> bool:
+    detail = normalize_plan_detail(str(row.get("code_detail") or ""))
+    if not detail:
+        return False
+    text = normalize_plan_detail(point_text)
+    return detail in text
 
 
 def floor_tokens(text: str) -> set:
     value = re.sub(r"\s+", "", str(text or ""))
-    tokens = set(re.findall(r"\d+(?=层)", value))
-    for match in re.finditer(r"((?:\d+[、,，/和及])+(\d+))层", value):
+    tokens = set()
+    if re.fullmatch(r"\d+", value):
+        tokens.add(value)
+    tokens.update(re.findall(r"\d+(?=[层楼])", value))
+    for match in re.finditer(r"((?:\d+[、,，/和及])+(\d+))[层楼]", value):
         tokens.update(re.findall(r"\d+", match.group(1)))
     if "顶层" in value:
         tokens.add("顶层")
@@ -794,7 +1633,7 @@ def group_records_by_point(records: List[Dict[str, Any]]) -> Dict[str, Dict[str,
             grouped[code] = {"plan": plan, "records": []}
         grouped[code]["records"].append(record)
     for value in grouped.values():
-        value["records"].sort(key=lambda item: item["source_order"])
+        value["records"].sort(key=noise_record_sort_key)
     return grouped
 
 
@@ -821,8 +1660,17 @@ def group_sensitive_records_for_result(records: List[Dict[str, Any]]) -> Dict[st
             grouped[group_key] = {"plan": result_plan, "records": []}
         grouped[group_key]["records"].append(record)
     for value in grouped.values():
-        value["records"].sort(key=lambda item: item["source_order"])
+        value["records"].sort(key=noise_record_sort_key)
     return grouped
+
+
+def noise_record_sort_key(record: Dict[str, Any]) -> Tuple[int, int]:
+    table_order = record.get("source_table_order")
+    source_order = record.get("source_order")
+    return (
+        int(table_order) if table_order is not None else 9999,
+        int(source_order) if source_order is not None else 0,
+    )
 
 
 def is_remapped_background_record(record: Dict[str, Any], plan: Dict[str, Any]) -> bool:
@@ -851,9 +1699,12 @@ def extract_report_sample_code(text: str) -> str:
 def result_position_for_record(record: Dict[str, Any], plan: Dict[str, Any]) -> str:
     point_text = str(record.get("point_text") or "")
     raw_code = str(record.get("raw_point_code") or "")
+    marker, _marker_source = record_indoor_outdoor_marker(record, plan)
     if is_background_record(record):
-        return background_position_for_record(record, plan)
+        return apply_indoor_outdoor_marker(background_position_for_record(record, plan), marker)
     report_position = extract_position_from_point_text(point_text, record, plan)
+    if report_position:
+        report_position = apply_indoor_outdoor_marker(report_position, marker)
     if has_indoor_outdoor_marker(report_position):
         return report_position
     if report_position and has_orientation_marker(report_position):
@@ -867,18 +1718,15 @@ def result_position_for_record(record: Dict[str, Any], plan: Dict[str, Any]) -> 
         except ValueError:
             sub_index = -1
         if 0 <= sub_index < len(plan_positions):
-            return plan_positions[sub_index]
+            return apply_indoor_outdoor_marker(plan_positions[sub_index], marker)
     floor_position = extract_floor_position(point_text)
     if floor_position:
-        return enrich_floor_position_with_plan_context(floor_position, plan)
-    return plan.get("position") or point_text or "-"
+        return apply_indoor_outdoor_marker(enrich_floor_position_with_plan_context(floor_position, plan), marker)
+    return apply_indoor_outdoor_marker(plan.get("position") or point_text or "-", marker)
 
 
 def clean_result_point_name(record: Dict[str, Any], plan: Dict[str, Any]) -> str:
-    plan_name = sanitize_result_point_name(plan.get("point_name"), plan)
-    if plan_name:
-        return plan_name
-    return sanitize_result_point_name(result_name_for_record(record, plan), plan) or "-"
+    return clean_result_table_point_name(record, plan)
 
 
 def sanitize_result_point_name(value: Any, plan: Dict[str, Any]) -> str:
@@ -901,6 +1749,10 @@ def sanitize_result_point_name(value: Any, plan: Dict[str, Any]) -> str:
 
 
 def clean_result_position(value: Any, record: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    _report_name, report_position = split_monitor_point_identity(record.get("point_text"), plan, record)
+    marker, _marker_source = record_indoor_outdoor_marker(record, plan)
+    if report_position and not is_background_record(record):
+        return apply_indoor_outdoor_marker(report_position, marker)
     text = str(value or "").strip()
     if not text:
         return "-"
@@ -916,10 +1768,10 @@ def clean_result_position(value: Any, record: Dict[str, Any], plan: Dict[str, An
     text = normalize_position_text(text)
     text = re.sub(r"\s+", "", text).strip("、，,;；")
     if is_background_record(record):
-        return append_background_marker(extract_floor_position_fragment(text) or text)
+        return apply_indoor_outdoor_marker(append_background_marker(extract_floor_position_fragment(text) or text), marker)
     if not has_orientation_marker(text):
         text = extract_floor_position_fragment(text) or text
-    return text or "-"
+    return apply_indoor_outdoor_marker(text or "-", marker)
 
 
 def extract_position_from_point_text(text: str, record: Dict[str, Any], plan: Dict[str, Any]) -> str:
@@ -1006,6 +1858,54 @@ def has_indoor_outdoor_marker(text: str) -> bool:
     return "室内" in str(text or "") or "室外" in str(text or "")
 
 
+def record_indoor_outdoor_marker(record: Dict[str, Any], plan: Optional[Dict[str, Any]] = None) -> Tuple[str, str]:
+    header_text = " ".join(
+        str(item or "")
+        for item in [
+            record.get("laeq_key"),
+            *(record.get("source_headers") or []),
+            *((record.get("raw") or {}).keys()),
+        ]
+    )
+    if "室内噪声级" in header_text or "室内" in header_text:
+        return "室内", "result_header"
+    if "室外噪声级" in header_text or "室外" in header_text:
+        return "室外", "result_header"
+
+    point_text = str(record.get("point_text") or "")
+    if "室内" in point_text:
+        return "室内", "point_text"
+    if "室外" in point_text:
+        return "室外", "point_text"
+
+    plan_position = str((plan or {}).get("position") or "")
+    if "室内" in plan_position:
+        return "室内", "plan_position"
+    if "室外" in plan_position:
+        return "室外", "plan_position"
+    return "", ""
+
+
+def apply_indoor_outdoor_marker(position: Any, marker: str) -> str:
+    text = str(position or "").strip()
+    if not text or text == "-":
+        return text or "-"
+    marker = str(marker or "").strip()
+    if marker not in {"室内", "室外"}:
+        return text
+    opposite = "室外" if marker == "室内" else "室内"
+    if marker in text:
+        return text
+    if opposite in text:
+        return text.replace(opposite, marker)
+    if re.fullmatch(r"\d+\s*[层楼]|顶层", text):
+        return f"{text}{marker}"
+    floor = extract_floor_position_fragment(text)
+    if floor and marker not in floor and opposite not in floor:
+        return text.replace(floor, f"{floor}{marker}", 1)
+    return f"{text}{marker}"
+
+
 def has_orientation_marker(text: str) -> bool:
     return bool(re.search(r"(面向|背向|首排|第二排|本项目|道路|铁路|陇海线)", str(text or "")))
 
@@ -1046,15 +1946,7 @@ def strip_point_identity(text: str, raw_code: str, station: str, point_name: str
 
 
 def attenuation_position_for_record(record: Dict[str, Any], plan: Dict[str, Any]) -> str:
-    point_text = str(record.get("point_text") or "")
-    match = re.search(
-        r"(距离[^，。；;\r\n]*?\d+\s*m\s*处(?:空地)?)",
-        point_text,
-        flags=re.IGNORECASE,
-    )
-    if match:
-        return re.sub(r"\s+", "", match.group(1))
-    return plan.get("position") or point_text or "-"
+    return clean_attenuation_point_position(plan, record)
 
 
 def result_name_for_record(record: Dict[str, Any], plan: Dict[str, Any]) -> str:
@@ -1123,11 +2015,9 @@ def compute_point_metrics(records: List[Dict[str, Any]], plan: Dict[str, Any]) -
             warnings.append(f"{plan.get('point_code')} 第{day_index + 1}天夜间缺失")
     avg_day = round_half_up(sum(day_values) / len(day_values)) if day_values else None
     avg_night = round_half_up(sum(night_values) / len(night_values)) if night_values else None
-    standard_class = plan.get("standard_class")
-    standard_day = DAY_LIMITS.get(standard_class)
-    standard_night = NIGHT_LIMITS.get(standard_class)
+    standard_day, standard_night = noise_standard_limits(plan)
     if standard_day is None or standard_night is None:
-        warnings.append(f"{plan.get('point_code')} 未识别现状标准: {standard_class}")
+        warnings.append(f"{plan.get('point_code')} 未识别现状标准: {plan.get('standard_class_raw') or plan.get('standard_class')}")
     result["avg_day"] = value_or_dash(avg_day)
     result["avg_night"] = value_or_dash(avg_night)
     result["standard_day"] = value_or_dash(standard_day)
@@ -1139,25 +2029,20 @@ def compute_point_metrics(records: List[Dict[str, Any]], plan: Dict[str, Any]) -
 
 
 def paired_records(records: List[Dict[str, Any]]) -> List[Dict[str, Dict[str, Any]]]:
+    day_records = [record for record in records if record.get("period") == "day"]
+    night_records = [record for record in records if record.get("period") == "night"]
+    unknown_records = [record for record in records if record.get("period") not in {"day", "night"}]
     pairs: List[Dict[str, Dict[str, Any]]] = []
-    current: Dict[str, Dict[str, Any]] = {}
-    for record in records:
-        period = record.get("period")
-        if period == "day":
-            if current:
-                pairs.append(current)
-            current = {"day": record}
-        elif period == "night":
-            if not current:
-                current = {}
-            current["night"] = record
-        else:
-            if not current:
-                current = {}
-            current.setdefault("unknown", record)
-    if current:
-        pairs.append(current)
-    return pairs[:2]
+    for index in range(2):
+        pair: Dict[str, Dict[str, Any]] = {}
+        if index < len(day_records):
+            pair["day"] = day_records[index]
+        if index < len(night_records):
+            pair["night"] = night_records[index]
+        if index < len(unknown_records):
+            pair["unknown"] = unknown_records[index]
+        pairs.append(pair)
+    return pairs
 
 
 def build_compliance_summary(table2: Dict[str, Any], table3: Dict[str, Any]) -> Dict[str, Any]:
@@ -1200,7 +2085,9 @@ def register_noise_tables(
     table3: Dict[str, Any],
     table_indoor: Optional[Dict[str, Any]] = None,
 ) -> None:
-    tables = [table1, table2]
+    tables = [table1]
+    sensitive_tables = table2.get("subtables") or [table2]
+    tables.extend(sensitive_tables)
     if table_indoor and table_indoor.get("rows"):
         tables.append(table_indoor)
     if table3.get("rows"):
@@ -1735,24 +2622,35 @@ def build_docx(
     add_section_heading(doc, numbering.next_level2_heading("noise", "监测结果"))
     add_body_paragraph(doc, texts["monitoring_result_text"])
     add_level3_heading(doc, numbering.next_level3_heading("noise", "敏感点声环境质量现状"))
-    sensitive_label = numbering.table_label(NOISE_TABLE_SENSITIVE)
-    add_body_paragraph(doc, f"监测结果见{sensitive_label}。")
     add_landscape_section(doc)
-    add_caption(doc, numbering.table_caption(NOISE_TABLE_SENSITIVE))
-    add_result_table(doc, table2["rows"], include_flow=True)
+    sensitive_tables = table2.get("subtables") or [table2]
+    labels = [numbering.table_label(item["table_key"]) for item in sensitive_tables if item.get("rows")]
+    if labels:
+        add_body_paragraph(doc, "监测结果见" + "、".join(labels) + "。")
+    for subtable in sensitive_tables:
+        if not subtable.get("rows"):
+            continue
+        add_caption(doc, numbering.table_caption(subtable["table_key"]))
+        add_result_table(doc, subtable["rows"], include_flow=True, flow_label=subtable.get("flow_label"))
     add_body_paragraph(doc, texts["sensitive_conclusion"])
 
     if table_indoor.get("rows"):
         indoor_label = numbering.table_label(NOISE_TABLE_INDOOR)
         add_body_paragraph(doc, f"室内噪声监测结果统计见{indoor_label}。")
         add_caption(doc, numbering.table_caption(NOISE_TABLE_INDOOR))
-        add_result_table(doc, table_indoor["rows"], include_flow=True)
+        add_result_table(doc, table_indoor["rows"], include_flow=True, flow_label=table_indoor.get("flow_label"))
 
     if table3.get("rows"):
         add_level3_heading(doc, numbering.next_level3_heading("noise", "交通噪声监测结果"))
         add_body_paragraph(doc, texts["traffic_intro"])
         add_caption(doc, numbering.table_caption(NOISE_TABLE_ATTENUATION))
-        add_result_table(doc, table3["rows"], include_flow=True)
+        add_result_table(
+            doc,
+            table3["rows"],
+            include_flow=True,
+            flow_label=table3.get("flow_label"),
+            merge_name_only=True,
+        )
         add_body_paragraph(doc, texts["attenuation_conclusion"])
     add_portrait_section(doc)
     return doc
@@ -1779,49 +2677,74 @@ def format_exceed_items(items: List[Dict[str, Any]]) -> str:
     )
 
 
-def add_result_table(doc: Document, rows: List[Dict[str, Any]], include_flow: bool) -> None:
+def add_result_table(
+    doc: Document,
+    rows: List[Dict[str, Any]],
+    include_flow: bool,
+    flow_label: Optional[str] = None,
+    merge_name_only: bool = False,
+) -> None:
     include_flow = include_flow and has_traffic_flow(rows)
     headers = result_headers(include_flow=include_flow)
     table = doc.add_table(rows=3, cols=len(headers))
     table.style = TABLE_STYLE
-    build_result_table_header(table, include_flow=include_flow)
+    build_result_table_header(table, include_flow=include_flow, flow_label=flow_label or flow_label_from_rows(rows))
     for row in rows:
         cells = table.add_row().cells
         for i, header in enumerate(headers):
             value = row.get(header, "-")
             cells[i].text = "-" if value == 0 and header.startswith("exceed_") else str(value)
-    merge_result_identity_cells(table, headers, rows)
+    merge_blocks = merge_result_identity_cells(table, headers, rows, merge_name_only=merge_name_only)
     finalize_table(table, header_row_count=3)
+    for column_index, start_row, end_row in merge_blocks:
+        suppress_vertical_merge_inner_borders(table, column_index, start_row, end_row)
     doc.add_paragraph()
 
 
-def merge_result_identity_cells(table: Any, headers: List[str], rows: List[Dict[str, Any]]) -> None:
+def merge_result_identity_cells(
+    table: Any,
+    headers: List[str],
+    rows: List[Dict[str, Any]],
+    merge_name_only: bool = False,
+) -> List[Tuple[int, int, int]]:
     if len(rows) <= 1:
-        return
+        return []
     code_header = "监测点编号"
     name_header = "监测点名称"
     if code_header not in headers or name_header not in headers:
-        return
+        return []
     code_col = headers.index(code_header)
     name_col = headers.index(name_header)
     data_start = 3
+    merge_blocks: List[Tuple[int, int, int]] = []
     start = 0
     while start < len(rows):
         code = str(rows[start].get(code_header) or "").strip()
         name = str(rows[start].get(name_header) or "").strip()
         end = start
-        while (
-            end + 1 < len(rows)
-            and str(rows[end + 1].get(code_header) or "").strip() == code
-            and str(rows[end + 1].get(name_header) or "").strip() == name
-        ):
-            end += 1
+        if merge_name_only:
+            while (
+                end + 1 < len(rows)
+                and str(rows[end + 1].get(name_header) or "").strip() == name
+            ):
+                end += 1
+        else:
+            while (
+                end + 1 < len(rows)
+                and str(rows[end + 1].get(code_header) or "").strip() == code
+                and str(rows[end + 1].get(name_header) or "").strip() == name
+            ):
+                end += 1
         if end > start and code and name:
-            code_cell = table.cell(data_start + start, code_col).merge(table.cell(data_start + end, code_col))
-            code_cell.text = code
+            if not merge_name_only:
+                code_cell = table.cell(data_start + start, code_col).merge(table.cell(data_start + end, code_col))
+                code_cell.text = code
+                merge_blocks.append((code_col, data_start + start, data_start + end))
             name_cell = table.cell(data_start + start, name_col).merge(table.cell(data_start + end, name_col))
             name_cell.text = name
+            merge_blocks.append((name_col, data_start + start, data_start + end))
         start = end + 1
+    return merge_blocks
 
 
 def add_monitor_points_table(doc: Document, headers: List[str], rows: List[Dict[str, Any]]) -> None:
@@ -1841,9 +2764,72 @@ def add_monitor_points_table(doc: Document, headers: List[str], rows: List[Dict[
             cells[index].text = str(row.get(header, "-"))
             set_cell_text_style(cells[index], bold=False)
 
-    merge_repeated_data_columns(table, headers, rows, ["监测因子", "监测频次"])
+    merge_blocks = []
+    merge_blocks.extend(merge_consecutive_data_columns(table, headers, rows, ["监测点编号", "监测点名称"]))
+    merge_blocks.extend(merge_repeated_data_columns(table, headers, rows, ["监测因子", "监测频次"]))
     finalize_table(table, header_row_count=1)
+    for column_index, start_row, end_row in merge_blocks:
+        suppress_vertical_merge_inner_borders(table, column_index, start_row, end_row)
     doc.add_paragraph()
+
+
+def merge_consecutive_data_columns(
+    table: Any,
+    headers: List[str],
+    rows: List[Dict[str, Any]],
+    merge_headers: List[str],
+) -> List[Tuple[int, int, int]]:
+    if len(rows) <= 1:
+        return []
+    merge_blocks: List[Tuple[int, int, int]] = []
+    for header in merge_headers:
+        if header not in headers:
+            continue
+        column_index = headers.index(header)
+        start = 0
+        while start < len(rows):
+            value = str(rows[start].get(header, "")).strip()
+            end = start
+            while end + 1 < len(rows) and str(rows[end + 1].get(header, "")).strip() == value:
+                end += 1
+            if end > start and value and value not in {"-", "/", "—"}:
+                merged_cell = table.cell(1 + start, column_index).merge(table.cell(1 + end, column_index))
+                merged_cell.text = value
+                set_cell_text_style(merged_cell, bold=False)
+                merge_blocks.append((column_index, 1 + start, 1 + end))
+            start = end + 1
+    return merge_blocks
+
+
+def suppress_vertical_merge_inner_borders(table: Any, column_index: int, start_row: int, end_row: int) -> None:
+    """Hide inner horizontal borders for a vertical merge block.
+
+    Some Word/WPS renderers still draw table-level insideH borders through
+    vertically merged cells. Setting cell-level top/bottom borders to nil makes
+    the merge visually explicit.
+    """
+    if end_row <= start_row:
+        return
+    for row_index in range(start_row, end_row + 1):
+        tc = table._tbl.tr_lst[row_index].tc_lst[column_index]
+        tc_pr = tc.get_or_add_tcPr()
+        borders = tc_pr.find(qn("w:tcBorders"))
+        if borders is None:
+            borders = OxmlElement("w:tcBorders")
+            tc_pr.append(borders)
+        if row_index > start_row:
+            set_cell_border_nil(borders, "top")
+        if row_index < end_row:
+            set_cell_border_nil(borders, "bottom")
+
+
+def set_cell_border_nil(borders: Any, edge: str) -> None:
+    tag = qn(f"w:{edge}")
+    element = borders.find(tag)
+    if element is None:
+        element = OxmlElement(f"w:{edge}")
+        borders.append(element)
+    element.set(qn("w:val"), "nil")
 
 
 def merge_repeated_data_columns(
@@ -1851,9 +2837,10 @@ def merge_repeated_data_columns(
     headers: List[str],
     rows: List[Dict[str, Any]],
     merge_headers: List[str],
-) -> None:
+) -> List[Tuple[int, int, int]]:
     if len(rows) <= 1:
-        return
+        return []
+    merge_blocks: List[Tuple[int, int, int]] = []
     for header in merge_headers:
         if header not in headers:
             continue
@@ -1863,9 +2850,11 @@ def merge_repeated_data_columns(
         column_index = headers.index(header)
         merged_cell = table.cell(1, column_index).merge(table.cell(len(rows), column_index))
         merged_cell.text = values[0]
+        merge_blocks.append((column_index, 1, len(rows)))
+    return merge_blocks
 
 
-def build_result_table_header(table: Any, include_flow: bool = True) -> None:
+def build_result_table_header(table: Any, include_flow: bool = True, flow_label: str = "车流量（辆/20min）") -> None:
     # Left fixed columns: vertical merge across the three header rows.
     for col, text in [(0, "监测点编号"), (1, "监测点名称"), (2, "监测点位置")]:
         cell = table.cell(0, col).merge(table.cell(2, col))
@@ -1894,7 +2883,7 @@ def build_result_table_header(table: Any, include_flow: bool = True) -> None:
         12: "夜",
     }
     if include_flow:
-        table.cell(0, 13).merge(table.cell(0, 16)).text = "车流量（辆/20min）"
+        table.cell(0, 13).merge(table.cell(0, 16)).text = flow_label or "车流量（辆/20min）"
         table.cell(1, 13).merge(table.cell(1, 14)).text = "第一天"
         table.cell(1, 15).merge(table.cell(1, 16)).text = "第二天"
         day_night_labels.update(
@@ -1933,8 +2922,17 @@ def row_to_dict(headers: List[str], row: List[str]) -> Dict[str, Any]:
 
 
 def extract_point_code(text: str) -> Optional[str]:
-    match = re.search(r"\bNJ\d+(?:-\d+)?\b", text or "")
-    return match.group(0) if match else None
+    match = re.search(r"(?<![A-Za-z0-9])N(?:J)?\d+(?:-\d+)?(?![A-Za-z0-9-])", text or "", flags=re.IGNORECASE)
+    if not match:
+        return None
+    code = match.group(0).upper()
+    if code.startswith("N") and not code.startswith("NJ"):
+        return "NJ" + code[1:]
+    return code
+
+
+def is_valid_noise_point_code(code: Any) -> bool:
+    return bool(re.fullmatch(r"NJ\d+(?:-\d+)?", str(code or "").strip(), flags=re.IGNORECASE))
 
 
 def extract_distance(text: str) -> Optional[str]:
@@ -1986,7 +2984,7 @@ def flow_text(pairs: List[Dict[str, Dict[str, Any]]], day_index: int, period: st
 
 def point_sort_key(code: Any) -> Tuple[int, int, str]:
     text = str(code or "")
-    match = re.search(r"NJ(\d+)(?:-(\d+))?", text)
+    match = re.search(r"N(?:J)?(\d+)(?:-(\d+))?", text, flags=re.IGNORECASE)
     if not match:
         return (9999, 9999, text)
     return (int(match.group(1)), int(match.group(2) or 0), text)

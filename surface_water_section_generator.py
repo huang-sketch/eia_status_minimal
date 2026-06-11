@@ -38,6 +38,7 @@ from docx_layout import (
 )
 from docx_numbering import DocxNumbering, load_numbering
 from llm_client import LlmProfile, SSL_CONTEXT, build_rule_text_fallback_validation, chat_completion_json_object_with_recovery
+from table_schema_mapper import record_data_validation
 from text_polish_utils import build_text_polish_prompt, load_text_polish_guidance
 
 load_dotenv()
@@ -248,20 +249,69 @@ def build_monitor_points_table(
                 "序号": point_code,
                 "河流名称": config.get("river_name") or parsed.get("river_name") or "-",
                 "中心桩号": monitor_center_station(evidence, parsed),
-                "取样断面": evidence.get("取样断面") or parsed.get("sampling_section") or "-",
+                "取样断面": monitor_sampling_section(config, evidence, parsed),
                 "取样频次": evidence.get("取样频次") or infer_frequency(dates),
                 "监测因子": "、".join(factor_list),
                 "point_code": point_code,
                 "_point_order": index,
             }
         )
+    headers = ["序号", "河流名称", "中心桩号", "取样断面", "取样频次", "监测因子"]
+    warnings = hide_empty_monitor_point_columns(headers, rows)
+    if warnings:
+        write_json(DEBUG_DIR / "surface_water_monitor_points_warnings.json", warnings)
+        record_data_validation(
+            OUTPUT_DIR,
+            "surface_water_monitor_points",
+            valid=False,
+            warnings=warnings,
+        )
     return {
         "table_key": SURFACE_TABLE_MONITOR_POINTS,
         "caption_suffix": "水质监测断面布置",
         "title": "水质监测断面布置",
-        "headers": ["序号", "河流名称", "中心桩号", "取样断面", "取样频次", "监测因子"],
+        "headers": headers,
         "rows": rows,
+        "warnings": warnings,
     }
+
+
+def monitor_sampling_section(config: Dict[str, Any], evidence: Dict[str, Any], parsed: Dict[str, str]) -> str:
+    value = (
+        config.get("section_name")
+        or evidence.get("取样断面")
+        or evidence.get("监测断面")
+        or evidence.get("断面")
+        or evidence.get("断面位置")
+        or evidence.get("取样位置")
+        or evidence.get("采样位置")
+        or parsed.get("sampling_section")
+        or ""
+    )
+    text = str(value or "").strip()
+    return text or "-"
+
+
+def hide_empty_monitor_point_columns(headers: List[str], rows: List[Dict[str, Any]]) -> List[str]:
+    warnings: List[str] = []
+    optional_columns = {
+        "河流名称": "表3.1未显示河流名称列：监测方案和监测报告未提供河流名称。",
+        "中心桩号": "表3.1未显示中心桩号列：监测方案和监测报告未提供中心桩号。",
+    }
+    for header, warning in optional_columns.items():
+        if header not in headers:
+            continue
+        if all(is_blank_table_value(row.get(header)) for row in rows):
+            headers.remove(header)
+            for row in rows:
+                row.pop(header, None)
+            warnings.append(warning)
+    return warnings
+
+
+def is_blank_table_value(value: Any) -> bool:
+    text = str(value or "").strip()
+    return text in {"", "-", "/", "—", "无", "未提供", "None", "none", "null"}
 
 
 def monitor_center_station(evidence: Dict[str, Any], parsed: Dict[str, str]) -> str:

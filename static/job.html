@@ -122,7 +122,7 @@
     </div>
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260611-downloads-on-failed"></script>
   <script>
     const jobId = window.location.pathname.match(/^\/jobs\/([^/]+)\/?$/)?.[1];
     let timer = null;
@@ -186,6 +186,10 @@
         } else if (status.status === "failed") {
           clearInterval(timer);
           document.getElementById("mainPlaceholder").classList.remove("visible");
+          if (hasResultFiles(latestGroups)) {
+            document.getElementById("sidebarDownloads").style.display = "";
+            renderTextDownloads(latestGroups, jobId);
+          }
         }
       } catch (error) {
         console.error(error);
@@ -194,6 +198,10 @@
             "无法连接服务器，请确认 python web_app.py 正在运行";
         }
       }
+    }
+
+    function hasResultFiles(groups) {
+      return Object.values(groups || {}).some((group) => Array.isArray(group.files) && group.files.length > 0);
     }
 
     function updateHero(status) {
@@ -222,10 +230,10 @@
       const preview = await response.json();
 
       renderTable("surfaceWaterResults", preview.monitoring_extraction.surface_water_results, "monitoring", jobId);
-      renderTable("noiseSensitiveResults", preview.monitoring_extraction.noise_sensitive_results, "monitoring", jobId);
+      renderTableGroup("noiseSensitiveResults", preview.monitoring_extraction.noise_sensitive_results, "monitoring", jobId);
       renderTable("noiseAttenuationResults", preview.monitoring_extraction.noise_attenuation_results, "monitoring", jobId);
       renderTable("surfaceWaterCompliance", preview.compliance.surface_water_compliance, "surface_water_compliance", jobId);
-      renderTable("noiseSensitive", preview.compliance.noise_sensitive, "noise_compliance", jobId);
+      renderTableGroup("noiseSensitive", preview.compliance.noise_sensitive, "noise_compliance", jobId);
       renderTable("noiseAttenuation", preview.compliance.noise_attenuation, "noise_compliance", jobId);
       renderNoiseSummary(preview.compliance.noise_summary || {});
       renderLlmTextPolishStatus(preview.llm_text_polish || {});
