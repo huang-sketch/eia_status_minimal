@@ -96,3 +96,25 @@ Web 抽取相关环境变量：
 | `EIA_MAX_CHUNKS_PER_RUN` | Web 任务默认可处理 chunk 数，默认 `100`（CLI `main.py` 默认 `20`） |
 | `EIA_OUTPUT_DIR/extraction/` | 存放 `eia_result.json`、`records.json`、`meta.json` |
 | `EIA_OUTPUT_DIR/debug_tables/extraction_summary.json` | CLI/规则合并统计 |
+
+## Development and stabilization
+
+Install the test dependencies and run the deterministic regression suite:
+
+    python -m pip install -r requirements-dev.txt
+    python -m pytest
+
+The built-in Web job queue supports exactly one server worker. Queued jobs are
+recovered after a restart; a job that was already running is marked failed so
+that partially generated output is never resumed as if it were complete.
+
+LLM-assisted schema mappings are written to the per-job
+debug_tables/table_schema_candidates.json file for review.
+
+Review candidates without changing the repository configuration:
+
+    python scripts/promote_schema_candidates.py --input <candidate-json>
+
+After review, apply a conflict-free candidate set explicitly:
+
+    python scripts/promote_schema_candidates.py --input <candidate-json> --apply

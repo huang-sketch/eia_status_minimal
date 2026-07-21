@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 import zipfile
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -40,6 +41,7 @@ QUEUE_POLL_SECONDS = float(os.getenv("EIA_QUEUE_POLL_SECONDS", "2"))
 
 RUN_LOCK = threading.Lock()
 QUEUE_LOCK = threading.Lock()
+STATUS_WRITE_LOCK = threading.RLock()
 QUEUED_JOBS: List[str] = []
 CURRENT_JOB_ID: Optional[str] = None
 
@@ -98,6 +100,7 @@ RESULT_GROUP_DEFINITIONS = {
             "debug_tables/table_schema_llm_input.json",
             "debug_tables/table_schema_llm_output.json",
             "debug_tables/table_schema_validation.json",
+            "debug_tables/table_schema_candidates.json",
             "debug_tables/eia_router_diagnostics.json",
             "debug_tables/encoding_health_check.json",
             "debug_tables/table_llm_classification.json",
@@ -127,10 +130,20 @@ app = FastAPI(title="环评现状分析自动化系统")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-@app.on_event("startup")
 def startup_cleanup() -> None:
+    validate_single_worker_mode()
+    recover_persisted_jobs()
     cleanup_old_jobs()
 
+
+
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    startup_cleanup()
+    yield
+
+
+app.router.lifespan_context = app_lifespan
 
 @app.get("/api/health")
 def health() -> JSONResponse:
@@ -202,7 +215,6 @@ async def create_job(
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
     queued_at = datetime.now().isoformat(timespec="seconds")
-    queue_position = enqueue_job(job_id)
     write_json(
         input_dir / "project_meta.json",
         {
@@ -225,7 +237,7 @@ async def create_job(
             "current_step": "排队中",
             "error": None,
             "queued_at": queued_at,
-            "queue_position": queue_position,
+            "queue_position": None,
             "result_groups": {},
             "enable_llm_text_polish": enable_llm_text_polish,
             "enable_llm_extraction": enable_llm_extraction,
@@ -233,6 +245,8 @@ async def create_job(
             "schema_fallback": summarize_schema_status(output_dir, enable_llm_extraction),
         },
     )
+    queue_position = enqueue_job(job_id)
+    update_status(job_dir, {"queue_position": queue_position})
     background_tasks.add_task(
         run_job,
         job_id,
@@ -515,6 +529,96 @@ def queue_state_snapshot() -> Dict[str, Any]:
             "current_job_id": CURRENT_JOB_ID,
             "queued_jobs": list(QUEUED_JOBS),
         }
+
+
+def validate_single_worker_mode() -> None:
+    for variable in ("WEB_CONCURRENCY", "UVICORN_WORKERS"):
+        raw_value = str(os.getenv(variable, "1") or "1").strip()
+        try:
+            worker_count = int(raw_value)
+        except ValueError as exc:
+            raise RuntimeError(f"{variable} must be an integer") from exc
+        if worker_count != 1:
+            raise RuntimeError(
+                "The built-in EIA job queue requires one server worker; "
+                f"set {variable}=1 or use an external queue"
+            )
+
+
+def recover_persisted_jobs() -> None:
+    WEB_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    queued: List[Tuple[datetime, Path, Dict[str, Any]]] = []
+    for job_dir in WEB_JOBS_DIR.iterdir():
+        if not job_dir.is_dir():
+            continue
+        status = read_status_file(job_dir)
+        state = str(status.get("status") or "")
+        if state == "running":
+            update_status(
+                job_dir,
+                {
+                    "status": "failed",
+                    "current_step": "\u670d\u52a1\u4e2d\u65ad",
+                    "error": "\u670d\u52a1\u5728\u4efb\u52a1\u8fd0\u884c\u671f\u95f4\u4e2d\u65ad\uff1b\u8bf7\u91cd\u65b0\u63d0\u4ea4\u4efb\u52a1",
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                    "queue_position": 0,
+                },
+            )
+            continue
+        if state != "queued":
+            continue
+        queued_at = (
+            parse_status_time(status.get("queued_at"))
+            or parse_status_time(status.get("updated_at"))
+            or datetime.fromtimestamp(job_dir.stat().st_mtime)
+        )
+        queued.append((queued_at, job_dir, status))
+
+    queued.sort(key=lambda item: (item[0], item[1].name))
+    recovered: List[Tuple[str, Dict[str, Any]]] = []
+    for _queued_at, job_dir, status in queued:
+        job_id = str(status.get("job_id") or job_dir.name)
+        meta = read_project_meta_for_job(job_dir)
+        if not meta:
+            update_status(
+                job_dir,
+                {
+                    "status": "failed",
+                    "current_step": "\u6062\u590d\u5931\u8d25",
+                    "error": "\u6392\u961f\u4efb\u52a1\u7f3a\u5c11 project_meta.json\uff0c\u65e0\u6cd5\u6062\u590d",
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                    "queue_position": 0,
+                },
+            )
+            continue
+        enqueue_job(job_id)
+        recovered.append((job_id, meta))
+
+    for job_id, meta in recovered:
+        worker = threading.Thread(
+            target=run_job,
+            args=(
+                job_id,
+                bool(meta.get("run_surface_water", True)),
+                bool(meta.get("run_noise", True)),
+                bool(meta.get("enable_llm_text_polish", False)),
+                bool(meta.get("enable_llm_extraction", True)),
+            ),
+            name=f"eia-job-{job_id}",
+            daemon=True,
+        )
+        worker.start()
+
+
+def read_project_meta_for_job(job_dir: Path) -> Dict[str, Any]:
+    path = job_dir / "input" / "project_meta.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def cleanup_old_jobs() -> None:
@@ -1031,12 +1135,13 @@ def read_status(job_dir: Path) -> Dict[str, Any]:
 
 def update_status(job_dir: Path, patch: Dict[str, Any]) -> None:
     status_path = job_dir / "status.json"
-    current: Dict[str, Any] = {}
-    if status_path.exists():
-        current = json.loads(status_path.read_text(encoding="utf-8"))
-    current.update(patch)
-    current["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    write_json(status_path, current)
+    with STATUS_WRITE_LOCK:
+        current: Dict[str, Any] = {}
+        if status_path.exists():
+            current = json.loads(status_path.read_text(encoding="utf-8"))
+        current.update(patch)
+        current["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        write_json(status_path, current)
 
 
 def append_log(path: Path, message: str) -> None:
@@ -1047,7 +1152,13 @@ def append_log(path: Path, message: str) -> None:
 
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def is_relative_to(path: Path, parent: Path) -> bool:
