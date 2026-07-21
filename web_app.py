@@ -3,12 +3,13 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import zipfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
@@ -32,6 +33,15 @@ from table_schema_mapper import summarize_schema_status
 BASE_DIR = Path(__file__).resolve().parent
 WEB_JOBS_DIR = BASE_DIR / "runs" / "web_jobs"
 STATIC_DIR = BASE_DIR / "static"
+MAX_UPLOAD_BYTES = int(os.getenv("EIA_MAX_UPLOAD_MB", "30")) * 1024 * 1024
+JOB_RETENTION_COUNT = int(os.getenv("EIA_JOB_RETENTION_COUNT", "30"))
+JOB_RETENTION_DAYS = int(os.getenv("EIA_JOB_RETENTION_DAYS", "7"))
+QUEUE_POLL_SECONDS = float(os.getenv("EIA_QUEUE_POLL_SECONDS", "2"))
+
+RUN_LOCK = threading.Lock()
+QUEUE_LOCK = threading.Lock()
+QUEUED_JOBS: List[str] = []
+CURRENT_JOB_ID: Optional[str] = None
 
 REPORT_FILENAME = "监测报告.docx"
 PLAN_FILENAME = "监测方案.docx"
@@ -88,6 +98,10 @@ RESULT_GROUP_DEFINITIONS = {
             "debug_tables/table_schema_llm_input.json",
             "debug_tables/table_schema_llm_output.json",
             "debug_tables/table_schema_validation.json",
+            "debug_tables/eia_router_diagnostics.json",
+            "debug_tables/encoding_health_check.json",
+            "debug_tables/table_llm_classification.json",
+            "debug_tables/unclassified_candidate_tables.json",
         ],
     },
     "compliance": {
@@ -113,9 +127,35 @@ app = FastAPI(title="环评现状分析自动化系统")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.on_event("startup")
+def startup_cleanup() -> None:
+    cleanup_old_jobs()
+
+
 @app.get("/api/health")
 def health() -> JSONResponse:
-    return JSONResponse({"status": "ok"})
+    usage = shutil.disk_usage(BASE_DIR)
+    queue_snapshot = queue_state_snapshot()
+    return JSONResponse(
+        {
+            "status": "ok",
+            "disk": {
+                "total_mb": usage.total // (1024 * 1024),
+                "free_mb": usage.free // (1024 * 1024),
+            },
+            "jobs": {
+                "running": 1 if queue_snapshot["current_job_id"] else 0,
+                "current_job_id": queue_snapshot["current_job_id"],
+                "queued": len(queue_snapshot["queued_jobs"]),
+                "queued_jobs": queue_snapshot["queued_jobs"],
+            },
+            "limits": {
+                "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
+                "job_retention_count": JOB_RETENTION_COUNT,
+                "job_retention_days": JOB_RETENTION_DAYS,
+            },
+        }
+    )
 
 
 @app.get("/")
@@ -142,6 +182,7 @@ async def create_job(
     monitoring_report: UploadFile = File(...),
     monitoring_plan: UploadFile = File(...),
 ) -> JSONResponse:
+    cleanup_old_jobs()
     if not run_surface_water and not run_noise:
         raise HTTPException(status_code=400, detail="请至少选择一个生成内容")
     validate_docx_upload(monitoring_report, "监测报告")
@@ -154,8 +195,14 @@ async def create_job(
     input_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    await save_upload(monitoring_report, input_dir / REPORT_FILENAME)
-    await save_upload(monitoring_plan, input_dir / PLAN_FILENAME)
+    try:
+        await save_upload(monitoring_report, input_dir / REPORT_FILENAME)
+        await save_upload(monitoring_plan, input_dir / PLAN_FILENAME)
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    queued_at = datetime.now().isoformat(timespec="seconds")
+    queue_position = enqueue_job(job_id)
     write_json(
         input_dir / "project_meta.json",
         {
@@ -174,9 +221,11 @@ async def create_job(
         job_dir,
         {
             "job_id": job_id,
-            "status": "pending",
-            "current_step": "等待执行",
+            "status": "queued",
+            "current_step": "排队中",
             "error": None,
+            "queued_at": queued_at,
+            "queue_position": queue_position,
             "result_groups": {},
             "enable_llm_text_polish": enable_llm_text_polish,
             "enable_llm_extraction": enable_llm_extraction,
@@ -192,7 +241,7 @@ async def create_job(
         enable_llm_text_polish,
         enable_llm_extraction,
     )
-    return JSONResponse({"job_id": job_id, "status": "pending"})
+    return JSONResponse({"job_id": job_id, "status": "queued", "queue_position": queue_position})
 
 
 @app.get("/api/jobs/{job_id}")
@@ -251,9 +300,23 @@ def run_job(
     input_dir = job_dir / "input"
     output_dir = job_dir / "output"
     log_path = job_dir / "job.log"
+    acquired_slot = False
+    queue_wait_started = time.perf_counter()
 
     try:
-        update_status(job_dir, {"status": "running", "current_step": "初始化任务", "error": None})
+        acquired_slot = wait_for_job_turn(job_id, job_dir, log_path, queue_wait_started)
+        run_started = time.perf_counter()
+        update_status(
+            job_dir,
+            {
+                "status": "running",
+                "current_step": "初始化任务",
+                "error": None,
+                "queue_position": 0,
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "queue_elapsed_seconds": round(run_started - queue_wait_started, 2),
+            },
+        )
         update_status(
             job_dir,
             {
@@ -273,9 +336,17 @@ def run_job(
         env["ENABLE_LLM_TEXT_POLISH"] = "true" if enable_llm_text_polish else "false"
         env["ENABLE_LLM_EXTRACTION"] = "true" if enable_llm_extraction else "false"
         env["ENABLE_SCHEMA_FALLBACK"] = "true" if enable_llm_extraction else "false"
+        env.setdefault("ENABLE_LLM_TABLE_CLASSIFICATION_SHADOW", "false")
         env.setdefault("EIA_MAX_CHUNKS_PER_RUN", "100")
         reset_numbering(output_dir)
         cleanup_stale_section_docx(output_dir, run_noise, run_surface_water)
+
+        update_status(job_dir, {"current_step": "编码健康检查"})
+        run_optional_script("encoding_health_check.py", env, log_path)
+
+        if env.get("ENABLE_LLM_TABLE_CLASSIFICATION_SHADOW", "false").lower() == "true":
+            update_status(job_dir, {"current_step": "LLM table classification shadow diagnosis"})
+            run_optional_script("table_shadow_diagnosis.py", env, log_path)
 
         update_status(job_dir, {"current_step": "生成项目区域环境概况"})
         run_optional_script("project_area_overview_generator.py", env, log_path)
@@ -334,6 +405,8 @@ def run_job(
                 "status": "success",
                 "current_step": "完成",
                 "error": None,
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "run_elapsed_seconds": round(time.perf_counter() - run_started, 2),
                 "result_groups": build_result_groups(job_id),
                 "llm_text_polish": build_llm_text_polish_status(output_dir, enable_llm_text_polish),
                 "schema_fallback": summarize_schema_status(output_dir, enable_llm_extraction),
@@ -349,11 +422,142 @@ def run_job(
                 "status": "failed",
                 "current_step": "失败",
                 "error": str(exc),
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
                 "result_groups": build_result_groups(job_id),
                 "llm_text_polish": build_llm_text_polish_status(output_dir, enable_llm_text_polish),
                 "schema_fallback": summarize_schema_status(output_dir, enable_llm_extraction),
             },
         )
+    finally:
+        if acquired_slot:
+            release_job_slot(job_id)
+        else:
+            remove_queued_job(job_id)
+
+
+def enqueue_job(job_id: str) -> int:
+    with QUEUE_LOCK:
+        if job_id not in QUEUED_JOBS:
+            QUEUED_JOBS.append(job_id)
+        refresh_queue_positions_locked()
+        return QUEUED_JOBS.index(job_id) + 1
+
+
+def wait_for_job_turn(job_id: str, job_dir: Path, log_path: Path, wait_started: float) -> bool:
+    append_log(log_path, "job queued")
+    while True:
+        with QUEUE_LOCK:
+            if job_id not in QUEUED_JOBS:
+                QUEUED_JOBS.append(job_id)
+            position = QUEUED_JOBS.index(job_id) + 1
+            if position == 1 and RUN_LOCK.acquire(blocking=False):
+                global CURRENT_JOB_ID
+                CURRENT_JOB_ID = job_id
+                QUEUED_JOBS.pop(0)
+                refresh_queue_positions_locked()
+                append_log(log_path, f"job dequeued after {time.perf_counter() - wait_started:.2f}s")
+                return True
+            refresh_queue_positions_locked()
+        update_status(
+            job_dir,
+            {
+                "status": "queued",
+                "current_step": f"排队中（第{position}位）",
+                "queue_position": position,
+                "queue_elapsed_seconds": round(time.perf_counter() - wait_started, 2),
+            },
+        )
+        time.sleep(QUEUE_POLL_SECONDS)
+
+
+def release_job_slot(job_id: str) -> None:
+    global CURRENT_JOB_ID
+    should_release = False
+    with QUEUE_LOCK:
+        if CURRENT_JOB_ID == job_id:
+            CURRENT_JOB_ID = None
+            should_release = True
+        while job_id in QUEUED_JOBS:
+            QUEUED_JOBS.remove(job_id)
+        refresh_queue_positions_locked()
+    if should_release and RUN_LOCK.locked():
+        RUN_LOCK.release()
+
+
+def remove_queued_job(job_id: str) -> None:
+    with QUEUE_LOCK:
+        while job_id in QUEUED_JOBS:
+            QUEUED_JOBS.remove(job_id)
+        refresh_queue_positions_locked()
+
+
+def refresh_queue_positions_locked() -> None:
+    for index, queued_job_id in enumerate(list(QUEUED_JOBS), start=1):
+        job_dir = WEB_JOBS_DIR / queued_job_id
+        if not job_dir.exists():
+            continue
+        try:
+            update_status(
+                job_dir,
+                {
+                    "status": "queued",
+                    "current_step": f"排队中（第{index}位）",
+                    "queue_position": index,
+                },
+            )
+        except Exception:
+            continue
+
+
+def queue_state_snapshot() -> Dict[str, Any]:
+    with QUEUE_LOCK:
+        return {
+            "current_job_id": CURRENT_JOB_ID,
+            "queued_jobs": list(QUEUED_JOBS),
+        }
+
+
+def cleanup_old_jobs() -> None:
+    WEB_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    protected = set(queue_state_snapshot()["queued_jobs"])
+    if queue_state_snapshot()["current_job_id"]:
+        protected.add(str(queue_state_snapshot()["current_job_id"]))
+    cutoff = datetime.now() - timedelta(days=max(1, JOB_RETENTION_DAYS))
+    candidates: List[Tuple[datetime, Path, str]] = []
+    for job_dir in WEB_JOBS_DIR.iterdir():
+        if not job_dir.is_dir():
+            continue
+        status = read_status_file(job_dir)
+        job_id = str(status.get("job_id") or job_dir.name)
+        if job_id in protected or status.get("status") in {"queued", "running"}:
+            continue
+        updated = parse_status_time(status.get("updated_at")) or datetime.fromtimestamp(job_dir.stat().st_mtime)
+        candidates.append((updated, job_dir, job_id))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    for index, (updated, job_dir, _job_id) in enumerate(candidates):
+        if index < max(0, JOB_RETENTION_COUNT) and updated >= cutoff:
+            continue
+        if is_relative_to(job_dir.resolve(), WEB_JOBS_DIR.resolve()):
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def read_status_file(job_dir: Path) -> Dict[str, Any]:
+    status_path = job_dir / "status.json"
+    if not status_path.exists():
+        return {}
+    try:
+        return json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def parse_status_time(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
 
 
 def cleanup_stale_section_docx(output_dir: Path, run_noise: bool, run_surface_water: bool) -> None:
@@ -787,12 +991,26 @@ def validate_docx_upload(upload: UploadFile, label: str) -> None:
 
 
 async def save_upload(upload: UploadFile, path: Path) -> None:
-    with path.open("wb") as file:
-        while True:
-            chunk = await upload.read(1024 * 1024)
-            if not chunk:
-                break
-            file.write(chunk)
+    total = 0
+    try:
+        with path.open("wb") as file:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"上传文件超过限制：单个文件最大 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB",
+                    )
+                file.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=400, detail="上传文件为空")
+    except Exception:
+        if path.exists():
+            path.unlink()
+        raise
 
 
 def resolve_job_dir(job_id: str) -> Path:

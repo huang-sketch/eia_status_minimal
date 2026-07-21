@@ -15,6 +15,7 @@ function formatValue(value) {
 
 function statusLabel(value) {
   return {
+    queued: "排队中",
     pending: "等待中",
     running: "运行中",
     success: "成功",

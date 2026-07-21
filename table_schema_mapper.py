@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from eia_document_router import diagnose_rule_failure_with_llm
 from llm_client import LlmProfile, chat_completion_json_object
 
 
@@ -15,6 +16,7 @@ DEBUG_FILENAMES = {
     "detection": "table_schema_detection.json",
     "llm_input": "table_schema_llm_input.json",
     "llm_output": "table_schema_llm_output.json",
+    "router_diagnosis": "eia_router_diagnostics.json",
     "validation": "table_schema_validation.json",
 }
 
@@ -110,6 +112,30 @@ def resolve_table_schema(
     }
     if valid:
         promote_llm_candidates(config, schema_name, mapping, sources, job_id, source_table)
+    else:
+        diagnosis = diagnose_rule_failure_with_llm(
+            {
+                "schema": schema_name,
+                "candidate_rule": schema_name,
+                "missing_fields": missing_after_llm,
+                "headers": header_list,
+                "sample_rows": sample_rows or [],
+                "table_title": table_title,
+                "context": context,
+                "source_table": source_table,
+                "llm_status": llm_status,
+                "llm_error": llm_error,
+            }
+        )
+        write_debug_event(
+            output_dir,
+            "router_diagnosis",
+            {
+                "schema": schema_name,
+                "source_table": source_table,
+                "diagnosis": diagnosis,
+            },
+        )
 
     result = {
         "schema": schema_name,

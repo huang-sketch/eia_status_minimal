@@ -667,6 +667,7 @@ button:disabled {
 }
 
 .job-hero.running,
+.job-hero.queued,
 .job-hero.pending {
   border-color: #bfdbfe;
   background: var(--pending-bg);
@@ -734,6 +735,7 @@ button:disabled {
   flex-shrink: 0;
 }
 
+.pill.queued { background: var(--pending-bg); color: var(--pending); }
 .pill.pending { background: var(--pending-bg); color: var(--pending); }
 .pill.running { background: var(--pending-bg); color: var(--pending); }
 .pill.running::before {

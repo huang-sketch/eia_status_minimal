@@ -172,7 +172,7 @@
         renderSchemaFallbackStatus(status.schema_fallback || {});
         document.getElementById("logs").textContent = logs || "暂无日志";
 
-        const isRunning = status.status === "pending" || status.status === "running";
+        const isRunning = status.status === "queued" || status.status === "pending" || status.status === "running";
         document.getElementById("processingBanner").classList.toggle("visible", isRunning);
         document.getElementById("mainPlaceholder").classList.toggle("visible", isRunning);
 

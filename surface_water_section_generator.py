@@ -15,6 +15,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 from docx_layout import (
     HEADER_FILL,
@@ -37,6 +39,7 @@ from docx_layout import (
     table_needs_landscape,
 )
 from docx_numbering import DocxNumbering, load_numbering
+from formal_text_skill import build_surface_water_formal_text_validation, write_formal_text_validation
 from llm_client import LlmProfile, SSL_CONTEXT, build_rule_text_fallback_validation, chat_completion_json_object_with_recovery
 from table_schema_mapper import record_data_validation
 from text_polish_utils import build_text_polish_prompt, load_text_polish_guidance
@@ -145,6 +148,15 @@ def main() -> None:
         surface_results,
         numbering,
     )
+    formal_validation = build_surface_water_formal_text_validation(
+        table1,
+        table2,
+        table3,
+        standard_config,
+        surface_results,
+        texts,
+    )
+    write_formal_text_validation(DEBUG_DIR, formal_validation)
     doc = build_docx(table1, table2, table3, factor_list, evaluated_factors, texts, numbering)
     finalize_section_document(doc)
     doc.save(SECTION_PATH)
@@ -1103,7 +1115,7 @@ def build_docx(
         add_landscape_section(doc)
         landscape_active = True
     add_caption(doc, numbering.table_caption(SURFACE_TABLE_MONITOR_RESULTS))
-    add_table(doc, table2["headers"], table2["rows"])
+    add_surface_water_grouped_table(doc, table2["headers"], table2["rows"], ["序号", "河流"])
     if landscape_active and not table_needs_landscape(table3["headers"]):
         add_portrait_section(doc)
         landscape_active = False
@@ -1117,7 +1129,7 @@ def build_docx(
         add_landscape_section(doc)
         landscape_active = True
     add_caption(doc, numbering.table_caption(SURFACE_TABLE_COMPLIANCE))
-    add_table(doc, table3["headers"], table3["rows"])
+    add_surface_water_grouped_table(doc, table3["headers"], table3["rows"], ["编号"])
     if landscape_active:
         add_portrait_section(doc)
 
@@ -1145,6 +1157,86 @@ def add_monitor_points_table(doc: Document, headers: List[str], rows: List[Dict[
     merge_monitor_points_repeated_columns(table, headers, rows)
     finalize_table(table, header_row_count=1)
     doc.add_paragraph()
+
+
+def add_surface_water_grouped_table(
+    doc: Document,
+    headers: List[str],
+    rows: List[Dict[str, Any]],
+    merge_headers: List[str],
+) -> None:
+    table = doc.add_table(rows=1, cols=len(headers))
+    table.style = TABLE_STYLE
+    table.autofit = True
+    header_cells = table.rows[0].cells
+    for index, header in enumerate(headers):
+        header_cells[index].text = str(header)
+        if HEADER_FILL:
+            shade_cell(header_cells[index], HEADER_FILL)
+        set_cell_text_style(header_cells[index], bold=True)
+
+    for row in rows:
+        cells = table.add_row().cells
+        for index, header in enumerate(headers):
+            cells[index].text = str(row.get(header, "-"))
+            set_cell_text_style(cells[index], bold=False)
+
+    merge_surface_water_consecutive_columns(table, headers, rows, merge_headers)
+    finalize_table(table, header_row_count=1)
+    doc.add_paragraph()
+
+
+def merge_surface_water_consecutive_columns(
+    table: Any,
+    headers: List[str],
+    rows: List[Dict[str, Any]],
+    merge_headers: List[str],
+) -> None:
+    if len(rows) <= 1:
+        return
+    merge_blocks: List[Tuple[int, int, int]] = []
+    start = 0
+    while start < len(rows):
+        point_code = normalize_merge_value(rows[start].get("point_code"))
+        end = start
+        while end + 1 < len(rows) and normalize_merge_value(rows[end + 1].get("point_code")) == point_code:
+            end += 1
+        if point_code and end > start:
+            for header in merge_headers:
+                if header not in headers:
+                    continue
+                column_index = headers.index(header)
+                values = [normalize_merge_value(rows[index].get(header)) for index in range(start, end + 1)]
+                if not values or not values[0] or any(value != values[0] for value in values):
+                    continue
+                merged_cell = table.cell(1 + start, column_index).merge(table.cell(1 + end, column_index))
+                merged_cell.text = str(rows[start].get(header) or "-")
+                set_cell_text_style(merged_cell, bold=False)
+                merge_blocks.append((column_index, 1 + start, 1 + end))
+        start = end + 1
+    for column_index, start_row, end_row in merge_blocks:
+        suppress_vertical_merge_inner_borders(table, column_index, start_row, end_row)
+
+
+def suppress_vertical_merge_inner_borders(table: Any, column_index: int, start_row: int, end_row: int) -> None:
+    if end_row <= start_row:
+        return
+    for row_index in range(start_row, end_row + 1):
+        cell = table.cell(row_index, column_index)
+        tc_pr = cell._tc.get_or_add_tcPr()
+        borders = tc_pr.find(qn("w:tcBorders"))
+        if borders is None:
+            borders = OxmlElement("w:tcBorders")
+            tc_pr.append(borders)
+        for edge_name in ("top", "bottom"):
+            if (row_index == start_row and edge_name == "top") or (row_index == end_row and edge_name == "bottom"):
+                continue
+            tag = qn(f"w:{edge_name}")
+            border = borders.find(tag)
+            if border is None:
+                border = OxmlElement(f"w:{edge_name}")
+                borders.append(border)
+            border.set(qn("w:val"), "nil")
 
 
 def merge_monitor_points_repeated_columns(table: Any, headers: List[str], rows: List[Dict[str, Any]]) -> None:
