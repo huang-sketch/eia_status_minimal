@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Iterable, List
 
 from docx import Document
-from docx.enum.text import WD_BREAK
+from docx.enum.section import WD_SECTION
 
 from docx_layout import strip_document_list_numbering
 from docx_numbering import generation_order, section_docx_path
@@ -56,8 +56,7 @@ def append_docx(first_path: Path, second_path: Path, output_path: Path) -> None:
 
 
 def add_page_break(doc: Document) -> None:
-    paragraph = doc.add_paragraph()
-    paragraph.add_run().add_break(WD_BREAK.PAGE)
+    doc.add_section(WD_SECTION.NEW_PAGE)
 
 
 def append_body_elements(target_doc: Document, source_doc: Document) -> None:

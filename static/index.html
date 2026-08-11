@@ -43,16 +43,30 @@
             </div>
           </div>
 
+          <div class="field source-mode-field">
+            <span class="field-label">监测数据来源</span>
+            <div class="segmented-control" role="radiogroup" aria-label="监测数据来源">
+              <label>
+                <input type="radio" name="data_source_type" value="docx_report" checked />
+                <span>Word 监测报告</span>
+              </label>
+              <label>
+                <input type="radio" name="data_source_type" value="xlsx_data" />
+                <span>XLSX 监测数据</span>
+              </label>
+            </div>
+          </div>
+
           <div class="form-files">
             <div class="field">
-              <label class="field-label">监测报告</label>
+              <label id="dataFileLabel" class="field-label">监测报告</label>
               <div class="file-field">
                 <input id="monitoringReport" name="monitoring_report" type="file" accept=".docx" required />
                 <div class="file-drop">
-                  <div class="file-drop-icon">DOC</div>
+                  <div id="dataFileIcon" class="file-drop-icon">DOC</div>
                   <div class="file-drop-text">
                     <div class="file-drop-name" id="reportFileName">选择 .docx 文件</div>
-                    <div class="file-drop-hint">监测报告</div>
+                    <div id="dataFileHint" class="file-drop-hint">监测报告</div>
                   </div>
                 </div>
               </div>
@@ -119,7 +133,7 @@
         </ol>
         <div class="aside-note">
           <strong>文件要求</strong>
-          <p>仅支持 .docx 格式。监测报告应包含检测结果表，监测方案应包含点位与评价标准信息。</p>
+          <p>监测方案使用 .docx；监测数据可选择 Word 监测报告或标准 XLSX 数据表。</p>
         </div>
         <div class="aside-note">
           <strong>提交后</strong>
@@ -137,6 +151,22 @@
 
     bindFileInput("monitoringReport", "reportFileName");
     bindFileInput("monitoringPlan", "planFileName");
+    document.querySelectorAll('input[name="data_source_type"]').forEach((input) => {
+      input.addEventListener("change", updateDataSourceMode);
+    });
+    updateDataSourceMode();
+
+    function updateDataSourceMode() {
+      const xlsx = form.data_source_type.value === "xlsx_data";
+      const dataInput = document.getElementById("monitoringReport");
+      dataInput.accept = xlsx ? ".xlsx" : ".docx";
+      dataInput.value = "";
+      document.getElementById("dataFileLabel").textContent = xlsx ? "监测数据" : "监测报告";
+      document.getElementById("dataFileIcon").textContent = xlsx ? "XLS" : "DOC";
+      document.getElementById("dataFileHint").textContent = xlsx ? "地表水和噪声监测数据" : "监测报告";
+      document.getElementById("reportFileName").textContent = xlsx ? "选择 .xlsx 文件" : "选择 .docx 文件";
+    }
+
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();

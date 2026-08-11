@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,9 @@ CURRENT_JOB_ID: Optional[str] = None
 
 REPORT_FILENAME = "监测报告.docx"
 PLAN_FILENAME = "监测方案.docx"
+XLSX_DATA_FILENAME = "监测数据.xlsx"
+DATA_SOURCE_DOCX = "docx_report"
+DATA_SOURCE_XLSX = "xlsx_data"
 
 NOISE_MONITORING_COLUMNS = [
     "监测点编号",
@@ -62,6 +66,18 @@ NOISE_MONITORING_COLUMNS = [
     "traffic_flow_day1_night",
     "traffic_flow_day2_day",
     "traffic_flow_day2_night",
+    "traffic_flow_day1_day_large",
+    "traffic_flow_day1_day_medium",
+    "traffic_flow_day1_day_small",
+    "traffic_flow_day1_night_large",
+    "traffic_flow_day1_night_medium",
+    "traffic_flow_day1_night_small",
+    "traffic_flow_day2_day_large",
+    "traffic_flow_day2_day_medium",
+    "traffic_flow_day2_day_small",
+    "traffic_flow_day2_night_large",
+    "traffic_flow_day2_night_medium",
+    "traffic_flow_day2_night_small",
 ]
 
 NOISE_COMPLIANCE_COLUMNS = [
@@ -105,6 +121,9 @@ RESULT_GROUP_DEFINITIONS = {
             "debug_tables/encoding_health_check.json",
             "debug_tables/table_llm_classification.json",
             "debug_tables/unclassified_candidate_tables.json",
+            "debug_tables/xlsx_input_validation.json",
+            "debug_tables/point_correspondence.json",
+            "extraction/xlsx_surface_water_records.json",
         ],
     },
     "compliance": {
@@ -192,13 +211,15 @@ async def create_job(
     run_noise: bool = Form(True),
     enable_llm_text_polish: bool = Form(False),
     enable_llm_extraction: bool = Form(True),
+    data_source_type: str = Form(DATA_SOURCE_DOCX),
     monitoring_report: UploadFile = File(...),
     monitoring_plan: UploadFile = File(...),
 ) -> JSONResponse:
     cleanup_old_jobs()
     if not run_surface_water and not run_noise:
         raise HTTPException(status_code=400, detail="请至少选择一个生成内容")
-    validate_docx_upload(monitoring_report, "监测报告")
+    data_source_type = normalize_data_source_type(data_source_type)
+    validate_monitoring_data_upload(monitoring_report, data_source_type)
     validate_docx_upload(monitoring_plan, "监测方案")
 
     job_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
@@ -209,7 +230,8 @@ async def create_job(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        await save_upload(monitoring_report, input_dir / REPORT_FILENAME)
+        data_filename = XLSX_DATA_FILENAME if data_source_type == DATA_SOURCE_XLSX else REPORT_FILENAME
+        await save_upload(monitoring_report, input_dir / data_filename)
         await save_upload(monitoring_plan, input_dir / PLAN_FILENAME)
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -225,6 +247,8 @@ async def create_job(
             "run_noise": run_noise,
             "enable_llm_text_polish": enable_llm_text_polish,
             "enable_llm_extraction": enable_llm_extraction,
+            "data_source_type": data_source_type,
+            "monitoring_data_original_name": monitoring_report.filename or "",
             "created_at": datetime.now().isoformat(timespec="seconds"),
         },
     )
@@ -243,6 +267,7 @@ async def create_job(
             "enable_llm_extraction": enable_llm_extraction,
             "llm_text_polish": build_llm_text_polish_status(output_dir, enable_llm_text_polish),
             "schema_fallback": summarize_schema_status(output_dir, enable_llm_extraction),
+            "input_validation": build_input_validation_status(output_dir),
         },
     )
     queue_position = enqueue_job(job_id)
@@ -254,6 +279,7 @@ async def create_job(
         run_noise,
         enable_llm_text_polish,
         enable_llm_extraction,
+        data_source_type,
     )
     return JSONResponse({"job_id": job_id, "status": "queued", "queue_position": queue_position})
 
@@ -271,6 +297,7 @@ def get_job(job_id: str) -> JSONResponse:
         job_dir / "output",
         bool(status.get("enable_llm_extraction", True)),
     )
+    status["input_validation"] = build_input_validation_status(job_dir / "output")
     meta_path = job_dir / "input" / "project_meta.json"
     if meta_path.exists():
         status["project_meta"] = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -309,6 +336,7 @@ def run_job(
     run_noise: bool,
     enable_llm_text_polish: bool,
     enable_llm_extraction: bool,
+    data_source_type: str = DATA_SOURCE_DOCX,
 ) -> None:
     job_dir = WEB_JOBS_DIR / job_id
     input_dir = job_dir / "input"
@@ -350,6 +378,9 @@ def run_job(
         env["ENABLE_LLM_TEXT_POLISH"] = "true" if enable_llm_text_polish else "false"
         env["ENABLE_LLM_EXTRACTION"] = "true" if enable_llm_extraction else "false"
         env["ENABLE_SCHEMA_FALLBACK"] = "true" if enable_llm_extraction else "false"
+        env["EIA_DATA_SOURCE_TYPE"] = data_source_type
+        env["EIA_RUN_SURFACE_WATER"] = "true" if run_surface_water else "false"
+        env["EIA_RUN_NOISE"] = "true" if run_noise else "false"
         env.setdefault("ENABLE_LLM_TABLE_CLASSIFICATION_SHADOW", "false")
         env.setdefault("EIA_MAX_CHUNKS_PER_RUN", "100")
         reset_numbering(output_dir)
@@ -357,6 +388,20 @@ def run_job(
 
         update_status(job_dir, {"current_step": "编码健康检查"})
         run_optional_script("encoding_health_check.py", env, log_path)
+
+        if data_source_type == DATA_SOURCE_XLSX:
+            update_status(job_dir, {"current_step": "校核 XLSX 监测数据与方案点位"})
+            try:
+                run_script("xlsx_monitoring_parser.py", env, log_path)
+            except Exception as exc:
+                validation = build_input_validation_status(output_dir)
+                errors = list(validation.get("errors") or [])
+                preview_errors = errors[:8]
+                if len(errors) > len(preview_errors):
+                    preview_errors.append(f"另有 {len(errors) - len(preview_errors)} 项，详见输入校核结果")
+                details = "；".join(preview_errors)
+                raise RuntimeError(details or str(exc)) from exc
+            update_status(job_dir, {"input_validation": build_input_validation_status(output_dir)})
 
         if env.get("ENABLE_LLM_TABLE_CLASSIFICATION_SHADOW", "false").lower() == "true":
             update_status(job_dir, {"current_step": "LLM table classification shadow diagnosis"})
@@ -366,10 +411,11 @@ def run_job(
         run_optional_script("project_area_overview_generator.py", env, log_path)
 
         if run_noise:
-            update_status(job_dir, {"current_step": "声环境：预处理噪声表格"})
-            noise_prepare_started = time.perf_counter()
-            prepare_noise_debug_tables(input_dir, output_dir, log_path)
-            append_log(log_path, f"step duration: 声环境：预处理噪声表格 {time.perf_counter() - noise_prepare_started:.2f}s")
+            if data_source_type == DATA_SOURCE_DOCX:
+                update_status(job_dir, {"current_step": "声环境：预处理噪声表格"})
+                noise_prepare_started = time.perf_counter()
+                prepare_noise_debug_tables(input_dir, output_dir, log_path)
+                append_log(log_path, f"step duration: 声环境：预处理噪声表格 {time.perf_counter() - noise_prepare_started:.2f}s")
             update_status(job_dir, {"current_step": "声环境：生成 Word 章节"})
             run_script("noise_section_generator.py", env, log_path)
             update_status(
@@ -383,9 +429,10 @@ def run_job(
             append_log(log_path, f"schema fallback status: {schema_status['label']}; elapsed {schema_status.get('elapsed_ms', 0)}ms")
 
         if run_surface_water:
-            update_status(job_dir, {"current_step": "地表水：CLI 监测数据抽取"})
-            run_script("monitoring_extraction.py", env, log_path)
-            update_status(job_dir, {"current_step": "地表水：解析监测方案和监测报告，执行达标判定"})
+            if data_source_type == DATA_SOURCE_DOCX:
+                update_status(job_dir, {"current_step": "地表水：CLI 监测数据抽取"})
+                run_script("monitoring_extraction.py", env, log_path)
+            update_status(job_dir, {"current_step": "地表水：解析监测方案和监测数据，执行达标判定"})
             run_script("surface_water_pipeline.py", env, log_path)
             update_status(job_dir, {"schema_fallback": summarize_schema_status(output_dir, enable_llm_extraction)})
             schema_status = summarize_schema_status(output_dir, enable_llm_extraction)
@@ -407,11 +454,18 @@ def run_job(
         combine_started = time.perf_counter()
         combined_path = build_combined_section_docx(output_dir)
         append_log(log_path, f"combined section generated: {combined_path.relative_to(output_dir)}")
+        project_meta = read_project_meta_for_job(job_dir)
+        final_report_path = publish_final_report(
+            combined_path,
+            project_meta.get("report_name", ""),
+        )
+        final_report_filename = final_report_path.name
         append_log(log_path, f"step duration: 生成合并版 Word {time.perf_counter() - combine_started:.2f}s")
 
+        append_log(log_path, f"final report published: {final_report_filename}")
         update_status(job_dir, {"current_step": "打包输出文件"})
         zip_started = time.perf_counter()
-        create_output_zip(output_dir)
+        create_output_zip(output_dir, final_report_filename)
         append_log(log_path, f"step duration: 打包输出文件 {time.perf_counter() - zip_started:.2f}s")
         update_status(
             job_dir,
@@ -423,7 +477,9 @@ def run_job(
                 "run_elapsed_seconds": round(time.perf_counter() - run_started, 2),
                 "result_groups": build_result_groups(job_id),
                 "llm_text_polish": build_llm_text_polish_status(output_dir, enable_llm_text_polish),
+                "final_report_filename": final_report_filename,
                 "schema_fallback": summarize_schema_status(output_dir, enable_llm_extraction),
+                "input_validation": build_input_validation_status(output_dir),
             },
         )
         append_log(log_path, "job finished successfully")
@@ -440,6 +496,7 @@ def run_job(
                 "result_groups": build_result_groups(job_id),
                 "llm_text_polish": build_llm_text_polish_status(output_dir, enable_llm_text_polish),
                 "schema_fallback": summarize_schema_status(output_dir, enable_llm_extraction),
+                "input_validation": build_input_validation_status(output_dir),
             },
         )
     finally:
@@ -603,6 +660,7 @@ def recover_persisted_jobs() -> None:
                 bool(meta.get("run_noise", True)),
                 bool(meta.get("enable_llm_text_polish", False)),
                 bool(meta.get("enable_llm_extraction", True)),
+                normalize_data_source_type(meta.get("data_source_type", DATA_SOURCE_DOCX)),
             ),
             name=f"eia-job-{job_id}",
             daemon=True,
@@ -756,7 +814,28 @@ def prepare_noise_debug_tables(input_dir: Path, output_dir: Path, log_path: Path
         raise RuntimeError("未识别到噪声监测表，无法生成声环境章节")
 
 
-def create_output_zip(output_dir: Path) -> None:
+def build_final_report_filename(project_name: Any) -> str:
+    name = str(project_name or "").strip()
+    if name.lower().endswith(".docx"):
+        name = name[:-5].strip()
+    suffix = "\u73b0\u72b6\u8c03\u67e5\u4e0e\u8bc4\u4ef7"
+    if name.endswith(suffix):
+        name = name[: -len(suffix)].strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    name = name[:100].rstrip(" .") or "\u9879\u76ee"
+    return f"{name}{suffix}.docx"
+
+
+def publish_final_report(combined_path: Path, project_name: Any) -> Path:
+    combined_path = Path(combined_path)
+    final_path = combined_path.parent / build_final_report_filename(project_name)
+    if final_path.resolve() == combined_path.resolve():
+        return combined_path
+    shutil.copy2(combined_path, final_path)
+    return final_path
+
+
+def create_output_zip(output_dir: Path, final_report_filename: Optional[str] = None) -> None:
     zip_path = output_dir / "eia_outputs.zip"
     if zip_path.exists():
         zip_path.unlink()
@@ -765,13 +844,14 @@ def create_output_zip(output_dir: Path) -> None:
         PROJECT_AREA_OVERVIEW_FILENAME,
         SURFACE_WATER_SECTION_FILENAME,
     }
+    included_report = final_report_filename or COMBINED_SECTION_FILENAME
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in output_dir.rglob("*"):
             if not path.is_file() or path == zip_path:
                 continue
             if path.name in excluded_word_sections:
                 continue
-            if path.suffix.lower() == ".docx" and path.name != COMBINED_SECTION_FILENAME:
+            if path.suffix.lower() == ".docx" and path.name != included_report:
                 continue
             archive.write(path, path.relative_to(output_dir))
 
@@ -782,10 +862,22 @@ def build_result_groups(job_id: str) -> Dict[str, Dict[str, Any]]:
     groups: Dict[str, Dict[str, Any]] = {}
     for group_key, definition in RESULT_GROUP_DEFINITIONS.items():
         files: List[Dict[str, str]] = []
-        for relative in definition["files"]:
+        relatives = list(definition["files"])
+        if group_key == "text_output":
+            project_meta = read_project_meta_for_job(job_dir)
+            final_report_filename = build_final_report_filename(project_meta.get("report_name", ""))
+            if (output_dir / final_report_filename).exists():
+                relatives = [
+                    final_report_filename if relative == COMBINED_SECTION_FILENAME else relative
+                    for relative in relatives
+                ]
+        for relative in relatives:
             path = output_dir / relative
             if path.exists():
-                files.append({"name": path.name, "path": relative})
+                item = {"name": path.name, "path": relative}
+                if group_key == "text_output" and path.suffix.lower() == ".docx":
+                    item["label"] = "\u4e0b\u8f7d\u5b8c\u6574\u62a5\u544a"
+                files.append(item)
         groups[group_key] = {"title": definition["title"], "files": files}
     return groups
 
@@ -1086,6 +1178,33 @@ def read_optional_json(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return {}
+
+
+def build_input_validation_status(output_dir: Path) -> Dict[str, Any]:
+    payload = read_optional_json(Path(output_dir) / "debug_tables" / "xlsx_input_validation.json")
+    if not isinstance(payload, dict) or not payload:
+        return {"state": "not_run", "valid": None, "errors": [], "warnings": []}
+    return {
+        **payload,
+        "state": "valid" if payload.get("valid") else "failed",
+        "report_path": "debug_tables/xlsx_input_validation.json",
+        "correspondence_path": "debug_tables/point_correspondence.json",
+    }
+
+
+def normalize_data_source_type(value: Any) -> str:
+    normalized = str(value or DATA_SOURCE_DOCX).strip().lower()
+    if normalized not in {DATA_SOURCE_DOCX, DATA_SOURCE_XLSX}:
+        raise HTTPException(status_code=400, detail="不支持的监测数据来源")
+    return normalized
+
+
+def validate_monitoring_data_upload(upload: UploadFile, data_source_type: str) -> None:
+    filename = (upload.filename or "").lower()
+    expected = ".xlsx" if data_source_type == DATA_SOURCE_XLSX else ".docx"
+    label = "监测数据" if data_source_type == DATA_SOURCE_XLSX else "监测报告"
+    if not filename.endswith(expected):
+        raise HTTPException(status_code=400, detail=f"{label}必须是 {expected} 文件")
 
 
 def validate_docx_upload(upload: UploadFile, label: str) -> None:

@@ -92,17 +92,25 @@ def main() -> None:
     debug_dir.mkdir(parents=True, exist_ok=True)
 
     plan_path = find_docx(input_dir, "方案")
-    report_path = find_docx(input_dir, "报告")
-
     standard_config = parse_standard_config(plan_path)
-    extraction_records_path = output_dir / EXTRACTION_RECORDS_FILENAME
-    extraction_available = extraction_records_path.exists()
-    cli_raw_records = read_json(extraction_records_path) if extraction_available else []
-    if not isinstance(cli_raw_records, list):
-        cli_raw_records = []
-
-    cli_records = adapt_cli_surface_water_records(cli_raw_records)
-    rule_records = parse_surface_water_records(report_path)
+    data_source_type = os.getenv("EIA_DATA_SOURCE_TYPE", "docx_report")
+    if data_source_type == "xlsx_data":
+        xlsx_records_path = output_dir / "extraction" / "xlsx_surface_water_records.json"
+        if not xlsx_records_path.exists():
+            raise FileNotFoundError(f"缺少 XLSX 地表水标准记录: {xlsx_records_path}")
+        xlsx_records = read_json(xlsx_records_path)
+        cli_records = []
+        rule_records = xlsx_records if isinstance(xlsx_records, list) else []
+        extraction_available = True
+    else:
+        report_path = find_docx(input_dir, "报告")
+        extraction_records_path = output_dir / EXTRACTION_RECORDS_FILENAME
+        extraction_available = extraction_records_path.exists()
+        cli_raw_records = read_json(extraction_records_path) if extraction_available else []
+        if not isinstance(cli_raw_records, list):
+            cli_raw_records = []
+        cli_records = adapt_cli_surface_water_records(cli_raw_records)
+        rule_records = parse_surface_water_records(report_path)
     records = merge_cli_and_rule_records(cli_records, rule_records)
     align_surface_water_record_point_codes(records, standard_config)
     write_json(

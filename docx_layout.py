@@ -214,9 +214,28 @@ def finalize_table(table: Any, header_row_count: int = 0) -> None:
     style_table(table, header_row_count=header_row_count)
 
 
+def set_repeat_table_header(row: Any) -> None:
+    properties = row._tr.get_or_add_trPr()
+    marker = properties.find(qn("w:tblHeader"))
+    if marker is None:
+        marker = OxmlElement("w:tblHeader")
+        marker.set(qn("w:val"), "true")
+        properties.append(marker)
+
+
+def set_table_row_cant_split(row: Any) -> None:
+    properties = row._tr.get_or_add_trPr()
+    marker = properties.find(qn("w:cantSplit"))
+    if marker is None:
+        properties.append(OxmlElement("w:cantSplit"))
+
+
 def style_table(table: Any, header_row_count: int = 0) -> None:
     for row_index, row in enumerate(table.rows):
         is_header = row_index < header_row_count
+        set_table_row_cant_split(row)
+        if is_header:
+            set_repeat_table_header(row)
         for cell in row.cells:
             cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
             set_cell_margin(cell)
