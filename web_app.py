@@ -1,14 +1,17 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import zipfile
-from datetime import datetime
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
@@ -32,9 +35,22 @@ from table_schema_mapper import summarize_schema_status
 BASE_DIR = Path(__file__).resolve().parent
 WEB_JOBS_DIR = BASE_DIR / "runs" / "web_jobs"
 STATIC_DIR = BASE_DIR / "static"
+MAX_UPLOAD_BYTES = int(os.getenv("EIA_MAX_UPLOAD_MB", "30")) * 1024 * 1024
+JOB_RETENTION_COUNT = int(os.getenv("EIA_JOB_RETENTION_COUNT", "30"))
+JOB_RETENTION_DAYS = int(os.getenv("EIA_JOB_RETENTION_DAYS", "7"))
+QUEUE_POLL_SECONDS = float(os.getenv("EIA_QUEUE_POLL_SECONDS", "2"))
+
+RUN_LOCK = threading.Lock()
+QUEUE_LOCK = threading.Lock()
+STATUS_WRITE_LOCK = threading.RLock()
+QUEUED_JOBS: List[str] = []
+CURRENT_JOB_ID: Optional[str] = None
 
 REPORT_FILENAME = "监测报告.docx"
 PLAN_FILENAME = "监测方案.docx"
+XLSX_DATA_FILENAME = "监测数据.xlsx"
+DATA_SOURCE_DOCX = "docx_report"
+DATA_SOURCE_XLSX = "xlsx_data"
 
 NOISE_MONITORING_COLUMNS = [
     "监测点编号",
@@ -50,6 +66,18 @@ NOISE_MONITORING_COLUMNS = [
     "traffic_flow_day1_night",
     "traffic_flow_day2_day",
     "traffic_flow_day2_night",
+    "traffic_flow_day1_day_large",
+    "traffic_flow_day1_day_medium",
+    "traffic_flow_day1_day_small",
+    "traffic_flow_day1_night_large",
+    "traffic_flow_day1_night_medium",
+    "traffic_flow_day1_night_small",
+    "traffic_flow_day2_day_large",
+    "traffic_flow_day2_day_medium",
+    "traffic_flow_day2_day_small",
+    "traffic_flow_day2_night_large",
+    "traffic_flow_day2_night_medium",
+    "traffic_flow_day2_night_small",
 ]
 
 NOISE_COMPLIANCE_COLUMNS = [
@@ -88,6 +116,14 @@ RESULT_GROUP_DEFINITIONS = {
             "debug_tables/table_schema_llm_input.json",
             "debug_tables/table_schema_llm_output.json",
             "debug_tables/table_schema_validation.json",
+            "debug_tables/table_schema_candidates.json",
+            "debug_tables/eia_router_diagnostics.json",
+            "debug_tables/encoding_health_check.json",
+            "debug_tables/table_llm_classification.json",
+            "debug_tables/unclassified_candidate_tables.json",
+            "debug_tables/xlsx_input_validation.json",
+            "debug_tables/point_correspondence.json",
+            "extraction/xlsx_surface_water_records.json",
         ],
     },
     "compliance": {
@@ -113,9 +149,45 @@ app = FastAPI(title="环评现状分析自动化系统")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+def startup_cleanup() -> None:
+    validate_single_worker_mode()
+    recover_persisted_jobs()
+    cleanup_old_jobs()
+
+
+
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    startup_cleanup()
+    yield
+
+
+app.router.lifespan_context = app_lifespan
+
 @app.get("/api/health")
 def health() -> JSONResponse:
-    return JSONResponse({"status": "ok"})
+    usage = shutil.disk_usage(BASE_DIR)
+    queue_snapshot = queue_state_snapshot()
+    return JSONResponse(
+        {
+            "status": "ok",
+            "disk": {
+                "total_mb": usage.total // (1024 * 1024),
+                "free_mb": usage.free // (1024 * 1024),
+            },
+            "jobs": {
+                "running": 1 if queue_snapshot["current_job_id"] else 0,
+                "current_job_id": queue_snapshot["current_job_id"],
+                "queued": len(queue_snapshot["queued_jobs"]),
+                "queued_jobs": queue_snapshot["queued_jobs"],
+            },
+            "limits": {
+                "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
+                "job_retention_count": JOB_RETENTION_COUNT,
+                "job_retention_days": JOB_RETENTION_DAYS,
+            },
+        }
+    )
 
 
 @app.get("/")
@@ -139,12 +211,15 @@ async def create_job(
     run_noise: bool = Form(True),
     enable_llm_text_polish: bool = Form(False),
     enable_llm_extraction: bool = Form(True),
+    data_source_type: str = Form(DATA_SOURCE_DOCX),
     monitoring_report: UploadFile = File(...),
     monitoring_plan: UploadFile = File(...),
 ) -> JSONResponse:
+    cleanup_old_jobs()
     if not run_surface_water and not run_noise:
         raise HTTPException(status_code=400, detail="请至少选择一个生成内容")
-    validate_docx_upload(monitoring_report, "监测报告")
+    data_source_type = normalize_data_source_type(data_source_type)
+    validate_monitoring_data_upload(monitoring_report, data_source_type)
     validate_docx_upload(monitoring_plan, "监测方案")
 
     job_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:8]}"
@@ -154,8 +229,14 @@ async def create_job(
     input_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    await save_upload(monitoring_report, input_dir / REPORT_FILENAME)
-    await save_upload(monitoring_plan, input_dir / PLAN_FILENAME)
+    try:
+        data_filename = XLSX_DATA_FILENAME if data_source_type == DATA_SOURCE_XLSX else REPORT_FILENAME
+        await save_upload(monitoring_report, input_dir / data_filename)
+        await save_upload(monitoring_plan, input_dir / PLAN_FILENAME)
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+    queued_at = datetime.now().isoformat(timespec="seconds")
     write_json(
         input_dir / "project_meta.json",
         {
@@ -166,6 +247,8 @@ async def create_job(
             "run_noise": run_noise,
             "enable_llm_text_polish": enable_llm_text_polish,
             "enable_llm_extraction": enable_llm_extraction,
+            "data_source_type": data_source_type,
+            "monitoring_data_original_name": monitoring_report.filename or "",
             "created_at": datetime.now().isoformat(timespec="seconds"),
         },
     )
@@ -174,16 +257,21 @@ async def create_job(
         job_dir,
         {
             "job_id": job_id,
-            "status": "pending",
-            "current_step": "等待执行",
+            "status": "queued",
+            "current_step": "排队中",
             "error": None,
+            "queued_at": queued_at,
+            "queue_position": None,
             "result_groups": {},
             "enable_llm_text_polish": enable_llm_text_polish,
             "enable_llm_extraction": enable_llm_extraction,
             "llm_text_polish": build_llm_text_polish_status(output_dir, enable_llm_text_polish),
             "schema_fallback": summarize_schema_status(output_dir, enable_llm_extraction),
+            "input_validation": build_input_validation_status(output_dir),
         },
     )
+    queue_position = enqueue_job(job_id)
+    update_status(job_dir, {"queue_position": queue_position})
     background_tasks.add_task(
         run_job,
         job_id,
@@ -191,8 +279,9 @@ async def create_job(
         run_noise,
         enable_llm_text_polish,
         enable_llm_extraction,
+        data_source_type,
     )
-    return JSONResponse({"job_id": job_id, "status": "pending"})
+    return JSONResponse({"job_id": job_id, "status": "queued", "queue_position": queue_position})
 
 
 @app.get("/api/jobs/{job_id}")
@@ -208,6 +297,7 @@ def get_job(job_id: str) -> JSONResponse:
         job_dir / "output",
         bool(status.get("enable_llm_extraction", True)),
     )
+    status["input_validation"] = build_input_validation_status(job_dir / "output")
     meta_path = job_dir / "input" / "project_meta.json"
     if meta_path.exists():
         status["project_meta"] = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -246,14 +336,29 @@ def run_job(
     run_noise: bool,
     enable_llm_text_polish: bool,
     enable_llm_extraction: bool,
+    data_source_type: str = DATA_SOURCE_DOCX,
 ) -> None:
     job_dir = WEB_JOBS_DIR / job_id
     input_dir = job_dir / "input"
     output_dir = job_dir / "output"
     log_path = job_dir / "job.log"
+    acquired_slot = False
+    queue_wait_started = time.perf_counter()
 
     try:
-        update_status(job_dir, {"status": "running", "current_step": "初始化任务", "error": None})
+        acquired_slot = wait_for_job_turn(job_id, job_dir, log_path, queue_wait_started)
+        run_started = time.perf_counter()
+        update_status(
+            job_dir,
+            {
+                "status": "running",
+                "current_step": "初始化任务",
+                "error": None,
+                "queue_position": 0,
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "queue_elapsed_seconds": round(run_started - queue_wait_started, 2),
+            },
+        )
         update_status(
             job_dir,
             {
@@ -273,18 +378,44 @@ def run_job(
         env["ENABLE_LLM_TEXT_POLISH"] = "true" if enable_llm_text_polish else "false"
         env["ENABLE_LLM_EXTRACTION"] = "true" if enable_llm_extraction else "false"
         env["ENABLE_SCHEMA_FALLBACK"] = "true" if enable_llm_extraction else "false"
+        env["EIA_DATA_SOURCE_TYPE"] = data_source_type
+        env["EIA_RUN_SURFACE_WATER"] = "true" if run_surface_water else "false"
+        env["EIA_RUN_NOISE"] = "true" if run_noise else "false"
+        env.setdefault("ENABLE_LLM_TABLE_CLASSIFICATION_SHADOW", "false")
         env.setdefault("EIA_MAX_CHUNKS_PER_RUN", "100")
         reset_numbering(output_dir)
         cleanup_stale_section_docx(output_dir, run_noise, run_surface_water)
+
+        update_status(job_dir, {"current_step": "编码健康检查"})
+        run_optional_script("encoding_health_check.py", env, log_path)
+
+        if data_source_type == DATA_SOURCE_XLSX:
+            update_status(job_dir, {"current_step": "校核 XLSX 监测数据与方案点位"})
+            try:
+                run_script("xlsx_monitoring_parser.py", env, log_path)
+            except Exception as exc:
+                validation = build_input_validation_status(output_dir)
+                errors = list(validation.get("errors") or [])
+                preview_errors = errors[:8]
+                if len(errors) > len(preview_errors):
+                    preview_errors.append(f"另有 {len(errors) - len(preview_errors)} 项，详见输入校核结果")
+                details = "；".join(preview_errors)
+                raise RuntimeError(details or str(exc)) from exc
+            update_status(job_dir, {"input_validation": build_input_validation_status(output_dir)})
+
+        if env.get("ENABLE_LLM_TABLE_CLASSIFICATION_SHADOW", "false").lower() == "true":
+            update_status(job_dir, {"current_step": "LLM table classification shadow diagnosis"})
+            run_optional_script("table_shadow_diagnosis.py", env, log_path)
 
         update_status(job_dir, {"current_step": "生成项目区域环境概况"})
         run_optional_script("project_area_overview_generator.py", env, log_path)
 
         if run_noise:
-            update_status(job_dir, {"current_step": "声环境：预处理噪声表格"})
-            noise_prepare_started = time.perf_counter()
-            prepare_noise_debug_tables(input_dir, output_dir, log_path)
-            append_log(log_path, f"step duration: 声环境：预处理噪声表格 {time.perf_counter() - noise_prepare_started:.2f}s")
+            if data_source_type == DATA_SOURCE_DOCX:
+                update_status(job_dir, {"current_step": "声环境：预处理噪声表格"})
+                noise_prepare_started = time.perf_counter()
+                prepare_noise_debug_tables(input_dir, output_dir, log_path)
+                append_log(log_path, f"step duration: 声环境：预处理噪声表格 {time.perf_counter() - noise_prepare_started:.2f}s")
             update_status(job_dir, {"current_step": "声环境：生成 Word 章节"})
             run_script("noise_section_generator.py", env, log_path)
             update_status(
@@ -298,9 +429,10 @@ def run_job(
             append_log(log_path, f"schema fallback status: {schema_status['label']}; elapsed {schema_status.get('elapsed_ms', 0)}ms")
 
         if run_surface_water:
-            update_status(job_dir, {"current_step": "地表水：CLI 监测数据抽取"})
-            run_script("monitoring_extraction.py", env, log_path)
-            update_status(job_dir, {"current_step": "地表水：解析监测方案和监测报告，执行达标判定"})
+            if data_source_type == DATA_SOURCE_DOCX:
+                update_status(job_dir, {"current_step": "地表水：CLI 监测数据抽取"})
+                run_script("monitoring_extraction.py", env, log_path)
+            update_status(job_dir, {"current_step": "地表水：解析监测方案和监测数据，执行达标判定"})
             run_script("surface_water_pipeline.py", env, log_path)
             update_status(job_dir, {"schema_fallback": summarize_schema_status(output_dir, enable_llm_extraction)})
             schema_status = summarize_schema_status(output_dir, enable_llm_extraction)
@@ -322,11 +454,18 @@ def run_job(
         combine_started = time.perf_counter()
         combined_path = build_combined_section_docx(output_dir)
         append_log(log_path, f"combined section generated: {combined_path.relative_to(output_dir)}")
+        project_meta = read_project_meta_for_job(job_dir)
+        final_report_path = publish_final_report(
+            combined_path,
+            project_meta.get("report_name", ""),
+        )
+        final_report_filename = final_report_path.name
         append_log(log_path, f"step duration: 生成合并版 Word {time.perf_counter() - combine_started:.2f}s")
 
+        append_log(log_path, f"final report published: {final_report_filename}")
         update_status(job_dir, {"current_step": "打包输出文件"})
         zip_started = time.perf_counter()
-        create_output_zip(output_dir)
+        create_output_zip(output_dir, final_report_filename)
         append_log(log_path, f"step duration: 打包输出文件 {time.perf_counter() - zip_started:.2f}s")
         update_status(
             job_dir,
@@ -334,9 +473,13 @@ def run_job(
                 "status": "success",
                 "current_step": "完成",
                 "error": None,
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "run_elapsed_seconds": round(time.perf_counter() - run_started, 2),
                 "result_groups": build_result_groups(job_id),
                 "llm_text_polish": build_llm_text_polish_status(output_dir, enable_llm_text_polish),
+                "final_report_filename": final_report_filename,
                 "schema_fallback": summarize_schema_status(output_dir, enable_llm_extraction),
+                "input_validation": build_input_validation_status(output_dir),
             },
         )
         append_log(log_path, "job finished successfully")
@@ -349,11 +492,234 @@ def run_job(
                 "status": "failed",
                 "current_step": "失败",
                 "error": str(exc),
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
                 "result_groups": build_result_groups(job_id),
                 "llm_text_polish": build_llm_text_polish_status(output_dir, enable_llm_text_polish),
                 "schema_fallback": summarize_schema_status(output_dir, enable_llm_extraction),
+                "input_validation": build_input_validation_status(output_dir),
             },
         )
+    finally:
+        if acquired_slot:
+            release_job_slot(job_id)
+        else:
+            remove_queued_job(job_id)
+
+
+def enqueue_job(job_id: str) -> int:
+    with QUEUE_LOCK:
+        if job_id not in QUEUED_JOBS:
+            QUEUED_JOBS.append(job_id)
+        refresh_queue_positions_locked()
+        return QUEUED_JOBS.index(job_id) + 1
+
+
+def wait_for_job_turn(job_id: str, job_dir: Path, log_path: Path, wait_started: float) -> bool:
+    append_log(log_path, "job queued")
+    while True:
+        with QUEUE_LOCK:
+            if job_id not in QUEUED_JOBS:
+                QUEUED_JOBS.append(job_id)
+            position = QUEUED_JOBS.index(job_id) + 1
+            if position == 1 and RUN_LOCK.acquire(blocking=False):
+                global CURRENT_JOB_ID
+                CURRENT_JOB_ID = job_id
+                QUEUED_JOBS.pop(0)
+                refresh_queue_positions_locked()
+                append_log(log_path, f"job dequeued after {time.perf_counter() - wait_started:.2f}s")
+                return True
+            refresh_queue_positions_locked()
+        update_status(
+            job_dir,
+            {
+                "status": "queued",
+                "current_step": f"排队中（第{position}位）",
+                "queue_position": position,
+                "queue_elapsed_seconds": round(time.perf_counter() - wait_started, 2),
+            },
+        )
+        time.sleep(QUEUE_POLL_SECONDS)
+
+
+def release_job_slot(job_id: str) -> None:
+    global CURRENT_JOB_ID
+    should_release = False
+    with QUEUE_LOCK:
+        if CURRENT_JOB_ID == job_id:
+            CURRENT_JOB_ID = None
+            should_release = True
+        while job_id in QUEUED_JOBS:
+            QUEUED_JOBS.remove(job_id)
+        refresh_queue_positions_locked()
+    if should_release and RUN_LOCK.locked():
+        RUN_LOCK.release()
+
+
+def remove_queued_job(job_id: str) -> None:
+    with QUEUE_LOCK:
+        while job_id in QUEUED_JOBS:
+            QUEUED_JOBS.remove(job_id)
+        refresh_queue_positions_locked()
+
+
+def refresh_queue_positions_locked() -> None:
+    for index, queued_job_id in enumerate(list(QUEUED_JOBS), start=1):
+        job_dir = WEB_JOBS_DIR / queued_job_id
+        if not job_dir.exists():
+            continue
+        try:
+            update_status(
+                job_dir,
+                {
+                    "status": "queued",
+                    "current_step": f"排队中（第{index}位）",
+                    "queue_position": index,
+                },
+            )
+        except Exception:
+            continue
+
+
+def queue_state_snapshot() -> Dict[str, Any]:
+    with QUEUE_LOCK:
+        return {
+            "current_job_id": CURRENT_JOB_ID,
+            "queued_jobs": list(QUEUED_JOBS),
+        }
+
+
+def validate_single_worker_mode() -> None:
+    for variable in ("WEB_CONCURRENCY", "UVICORN_WORKERS"):
+        raw_value = str(os.getenv(variable, "1") or "1").strip()
+        try:
+            worker_count = int(raw_value)
+        except ValueError as exc:
+            raise RuntimeError(f"{variable} must be an integer") from exc
+        if worker_count != 1:
+            raise RuntimeError(
+                "The built-in EIA job queue requires one server worker; "
+                f"set {variable}=1 or use an external queue"
+            )
+
+
+def recover_persisted_jobs() -> None:
+    WEB_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    queued: List[Tuple[datetime, Path, Dict[str, Any]]] = []
+    for job_dir in WEB_JOBS_DIR.iterdir():
+        if not job_dir.is_dir():
+            continue
+        status = read_status_file(job_dir)
+        state = str(status.get("status") or "")
+        if state == "running":
+            update_status(
+                job_dir,
+                {
+                    "status": "failed",
+                    "current_step": "\u670d\u52a1\u4e2d\u65ad",
+                    "error": "\u670d\u52a1\u5728\u4efb\u52a1\u8fd0\u884c\u671f\u95f4\u4e2d\u65ad\uff1b\u8bf7\u91cd\u65b0\u63d0\u4ea4\u4efb\u52a1",
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                    "queue_position": 0,
+                },
+            )
+            continue
+        if state != "queued":
+            continue
+        queued_at = (
+            parse_status_time(status.get("queued_at"))
+            or parse_status_time(status.get("updated_at"))
+            or datetime.fromtimestamp(job_dir.stat().st_mtime)
+        )
+        queued.append((queued_at, job_dir, status))
+
+    queued.sort(key=lambda item: (item[0], item[1].name))
+    recovered: List[Tuple[str, Dict[str, Any]]] = []
+    for _queued_at, job_dir, status in queued:
+        job_id = str(status.get("job_id") or job_dir.name)
+        meta = read_project_meta_for_job(job_dir)
+        if not meta:
+            update_status(
+                job_dir,
+                {
+                    "status": "failed",
+                    "current_step": "\u6062\u590d\u5931\u8d25",
+                    "error": "\u6392\u961f\u4efb\u52a1\u7f3a\u5c11 project_meta.json\uff0c\u65e0\u6cd5\u6062\u590d",
+                    "finished_at": datetime.now().isoformat(timespec="seconds"),
+                    "queue_position": 0,
+                },
+            )
+            continue
+        enqueue_job(job_id)
+        recovered.append((job_id, meta))
+
+    for job_id, meta in recovered:
+        worker = threading.Thread(
+            target=run_job,
+            args=(
+                job_id,
+                bool(meta.get("run_surface_water", True)),
+                bool(meta.get("run_noise", True)),
+                bool(meta.get("enable_llm_text_polish", False)),
+                bool(meta.get("enable_llm_extraction", True)),
+                normalize_data_source_type(meta.get("data_source_type", DATA_SOURCE_DOCX)),
+            ),
+            name=f"eia-job-{job_id}",
+            daemon=True,
+        )
+        worker.start()
+
+
+def read_project_meta_for_job(job_dir: Path) -> Dict[str, Any]:
+    path = job_dir / "input" / "project_meta.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def cleanup_old_jobs() -> None:
+    WEB_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    protected = set(queue_state_snapshot()["queued_jobs"])
+    if queue_state_snapshot()["current_job_id"]:
+        protected.add(str(queue_state_snapshot()["current_job_id"]))
+    cutoff = datetime.now() - timedelta(days=max(1, JOB_RETENTION_DAYS))
+    candidates: List[Tuple[datetime, Path, str]] = []
+    for job_dir in WEB_JOBS_DIR.iterdir():
+        if not job_dir.is_dir():
+            continue
+        status = read_status_file(job_dir)
+        job_id = str(status.get("job_id") or job_dir.name)
+        if job_id in protected or status.get("status") in {"queued", "running"}:
+            continue
+        updated = parse_status_time(status.get("updated_at")) or datetime.fromtimestamp(job_dir.stat().st_mtime)
+        candidates.append((updated, job_dir, job_id))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    for index, (updated, job_dir, _job_id) in enumerate(candidates):
+        if index < max(0, JOB_RETENTION_COUNT) and updated >= cutoff:
+            continue
+        if is_relative_to(job_dir.resolve(), WEB_JOBS_DIR.resolve()):
+            shutil.rmtree(job_dir, ignore_errors=True)
+
+
+def read_status_file(job_dir: Path) -> Dict[str, Any]:
+    status_path = job_dir / "status.json"
+    if not status_path.exists():
+        return {}
+    try:
+        return json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def parse_status_time(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
 
 
 def cleanup_stale_section_docx(output_dir: Path, run_noise: bool, run_surface_water: bool) -> None:
@@ -448,7 +814,28 @@ def prepare_noise_debug_tables(input_dir: Path, output_dir: Path, log_path: Path
         raise RuntimeError("未识别到噪声监测表，无法生成声环境章节")
 
 
-def create_output_zip(output_dir: Path) -> None:
+def build_final_report_filename(project_name: Any) -> str:
+    name = str(project_name or "").strip()
+    if name.lower().endswith(".docx"):
+        name = name[:-5].strip()
+    suffix = "\u73b0\u72b6\u8c03\u67e5\u4e0e\u8bc4\u4ef7"
+    if name.endswith(suffix):
+        name = name[: -len(suffix)].strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    name = name[:100].rstrip(" .") or "\u9879\u76ee"
+    return f"{name}{suffix}.docx"
+
+
+def publish_final_report(combined_path: Path, project_name: Any) -> Path:
+    combined_path = Path(combined_path)
+    final_path = combined_path.parent / build_final_report_filename(project_name)
+    if final_path.resolve() == combined_path.resolve():
+        return combined_path
+    shutil.copy2(combined_path, final_path)
+    return final_path
+
+
+def create_output_zip(output_dir: Path, final_report_filename: Optional[str] = None) -> None:
     zip_path = output_dir / "eia_outputs.zip"
     if zip_path.exists():
         zip_path.unlink()
@@ -457,13 +844,14 @@ def create_output_zip(output_dir: Path) -> None:
         PROJECT_AREA_OVERVIEW_FILENAME,
         SURFACE_WATER_SECTION_FILENAME,
     }
+    included_report = final_report_filename or COMBINED_SECTION_FILENAME
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in output_dir.rglob("*"):
             if not path.is_file() or path == zip_path:
                 continue
             if path.name in excluded_word_sections:
                 continue
-            if path.suffix.lower() == ".docx" and path.name != COMBINED_SECTION_FILENAME:
+            if path.suffix.lower() == ".docx" and path.name != included_report:
                 continue
             archive.write(path, path.relative_to(output_dir))
 
@@ -474,10 +862,22 @@ def build_result_groups(job_id: str) -> Dict[str, Dict[str, Any]]:
     groups: Dict[str, Dict[str, Any]] = {}
     for group_key, definition in RESULT_GROUP_DEFINITIONS.items():
         files: List[Dict[str, str]] = []
-        for relative in definition["files"]:
+        relatives = list(definition["files"])
+        if group_key == "text_output":
+            project_meta = read_project_meta_for_job(job_dir)
+            final_report_filename = build_final_report_filename(project_meta.get("report_name", ""))
+            if (output_dir / final_report_filename).exists():
+                relatives = [
+                    final_report_filename if relative == COMBINED_SECTION_FILENAME else relative
+                    for relative in relatives
+                ]
+        for relative in relatives:
             path = output_dir / relative
             if path.exists():
-                files.append({"name": path.name, "path": relative})
+                item = {"name": path.name, "path": relative}
+                if group_key == "text_output" and path.suffix.lower() == ".docx":
+                    item["label"] = "\u4e0b\u8f7d\u5b8c\u6574\u62a5\u544a"
+                files.append(item)
         groups[group_key] = {"title": definition["title"], "files": files}
     return groups
 
@@ -780,6 +1180,33 @@ def read_optional_json(path: Path) -> Any:
         return {}
 
 
+def build_input_validation_status(output_dir: Path) -> Dict[str, Any]:
+    payload = read_optional_json(Path(output_dir) / "debug_tables" / "xlsx_input_validation.json")
+    if not isinstance(payload, dict) or not payload:
+        return {"state": "not_run", "valid": None, "errors": [], "warnings": []}
+    return {
+        **payload,
+        "state": "valid" if payload.get("valid") else "failed",
+        "report_path": "debug_tables/xlsx_input_validation.json",
+        "correspondence_path": "debug_tables/point_correspondence.json",
+    }
+
+
+def normalize_data_source_type(value: Any) -> str:
+    normalized = str(value or DATA_SOURCE_DOCX).strip().lower()
+    if normalized not in {DATA_SOURCE_DOCX, DATA_SOURCE_XLSX}:
+        raise HTTPException(status_code=400, detail="不支持的监测数据来源")
+    return normalized
+
+
+def validate_monitoring_data_upload(upload: UploadFile, data_source_type: str) -> None:
+    filename = (upload.filename or "").lower()
+    expected = ".xlsx" if data_source_type == DATA_SOURCE_XLSX else ".docx"
+    label = "监测数据" if data_source_type == DATA_SOURCE_XLSX else "监测报告"
+    if not filename.endswith(expected):
+        raise HTTPException(status_code=400, detail=f"{label}必须是 {expected} 文件")
+
+
 def validate_docx_upload(upload: UploadFile, label: str) -> None:
     filename = upload.filename or ""
     if not filename.lower().endswith(".docx"):
@@ -787,12 +1214,26 @@ def validate_docx_upload(upload: UploadFile, label: str) -> None:
 
 
 async def save_upload(upload: UploadFile, path: Path) -> None:
-    with path.open("wb") as file:
-        while True:
-            chunk = await upload.read(1024 * 1024)
-            if not chunk:
-                break
-            file.write(chunk)
+    total = 0
+    try:
+        with path.open("wb") as file:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"上传文件超过限制：单个文件最大 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB",
+                    )
+                file.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=400, detail="上传文件为空")
+    except Exception:
+        if path.exists():
+            path.unlink()
+        raise
 
 
 def resolve_job_dir(job_id: str) -> Path:
@@ -813,12 +1254,13 @@ def read_status(job_dir: Path) -> Dict[str, Any]:
 
 def update_status(job_dir: Path, patch: Dict[str, Any]) -> None:
     status_path = job_dir / "status.json"
-    current: Dict[str, Any] = {}
-    if status_path.exists():
-        current = json.loads(status_path.read_text(encoding="utf-8"))
-    current.update(patch)
-    current["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    write_json(status_path, current)
+    with STATUS_WRITE_LOCK:
+        current: Dict[str, Any] = {}
+        if status_path.exists():
+            current = json.loads(status_path.read_text(encoding="utf-8"))
+        current.update(patch)
+        current["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        write_json(status_path, current)
 
 
 def append_log(path: Path, message: str) -> None:
@@ -829,7 +1271,13 @@ def append_log(path: Path, message: str) -> None:
 
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def is_relative_to(path: Path, parent: Path) -> bool:

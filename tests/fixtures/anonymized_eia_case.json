@@ -1,0 +1,36 @@
+{
+  "plan": {
+    "title": "\u793a\u4f8b\u5de5\u7a0b\u5730\u8868\u6c34\u76d1\u6d4b\u65b9\u6848",
+    "headers": ["\u5e8f\u53f7", "\u6cb3\u6d41\u540d\u79f0", "\u76d1\u6d4b\u4f4d\u7f6e", "\u8bc4\u4ef7\u6807\u51c6", "\u53d6\u6837\u65ad\u9762"],
+    "rows": [
+      ["WJ1", "\u793a\u4f8b\u6cb3", "\u793a\u4f8b\u6865\u4f4d\u4e0a\u6e38500m", "\u2162\u7c7b", "\u793a\u4f8b\u6cb3\u4e0a\u6e38\u65ad\u9762"]
+    ]
+  },
+  "report": {
+    "title": "\u5730\u8868\u6c34\u73af\u5883\u8d28\u91cf\u76d1\u6d4b\u7ed3\u679c",
+    "headers": ["\u91c7\u6837\u4f4d\u7f6e", "\u91c7\u6837\u65e5\u671f", "\u68c0\u6d4b\u9879\u76ee", "\u5355\u4f4d", "\u68c0\u6d4b\u7ed3\u679c", "\u6837\u54c1\u6027\u72b6"],
+    "rows": [
+      ["WJ1 \u793a\u4f8b\u6cb3\u4e0a\u6e38\u65ad\u9762", "2026-01-01", "\u6c34\u6e29", "\u2103", "20", "\u6e05\u6f88"],
+      ["WJ1 \u793a\u4f8b\u6cb3\u4e0a\u6e38\u65ad\u9762", "2026-01-01", "pH", "\u65e0\u91cf\u7eb2", "7.5", "\u6e05\u6f88"],
+      ["WJ1 \u793a\u4f8b\u6cb3\u4e0a\u6e38\u65ad\u9762", "2026-01-01", "\u6eb6\u89e3\u6c27", "mg/L", "6.0", "\u6e05\u6f88"]
+    ]
+  },
+  "expected": {
+  "noise_report": {
+    "title": "\u58f0\u73af\u5883\u8d28\u91cf\u76d1\u6d4b\u7ed3\u679c",
+    "headers": ["\u68c0\u6d4b\u4f4d\u7f6e", "\u76d1\u6d4b\u65f6\u95f4", "LAeq", "\u8f66\u6d41\u91cf"],
+    "rows": [
+      ["NJ1 \u793a\u4f8b\u67511\u5c42\u5ba4\u5916", "2026-01-01 \u663c\u95f4", "55", "120"]
+    ]
+  },
+    "point_code": "WJ1",
+    "river_name": "\u793a\u4f8b\u6cb3",
+    "standard_class": "\u2162\u7c7b",
+    "record_count": 3,
+    "factors": ["\u6c34\u6e29", "pH\u503c", "\u6eb6\u89e3\u6c27"],
+    "compliance": {
+      "pH\u503c": true,
+      "\u6eb6\u89e3\u6c27": true
+    }
+  }
+}

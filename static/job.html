@@ -74,6 +74,12 @@
           <strong>结构解析需人工复核</strong>
           <ul id="schemaReviewReasons"></ul>
         </div>
+        <div id="inputValidationBanner" class="schema-review-banner" style="display:none;">
+          <strong>XLSX 输入数据校核失败</strong>
+          <ul id="inputValidationReasons"></ul>
+          <div id="inputValidationDownloads" class="downloads"></div>
+        </div>
+
 
         <div id="mainPlaceholder" class="main-placeholder">
           <div class="placeholder-inner">
@@ -122,11 +128,12 @@
     </div>
   </main>
 
-  <script src="/static/app.js?v=20260611-downloads-on-failed"></script>
+  <script src="/static/app.js?v=20260731-result-download-fix"></script>
   <script>
     const jobId = window.location.pathname.match(/^\/jobs\/([^/]+)\/?$/)?.[1];
     let timer = null;
     let latestGroups = {};
+    let terminalHandled = false;
 
     bindTabButtons();
 
@@ -170,19 +177,22 @@
         document.getElementById("errorText").textContent = status.error || "-";
         renderLlmTextPolishStatus(status.llm_text_polish || {});
         renderSchemaFallbackStatus(status.schema_fallback || {});
+        renderInputValidationStatus(status.input_validation || {}, jobId);
         document.getElementById("logs").textContent = logs || "暂无日志";
 
-        const isRunning = status.status === "pending" || status.status === "running";
+        const isRunning = status.status === "queued" || status.status === "pending" || status.status === "running";
         document.getElementById("processingBanner").classList.toggle("visible", isRunning);
         document.getElementById("mainPlaceholder").classList.toggle("visible", isRunning);
 
         if (status.status === "success") {
           clearInterval(timer);
           document.getElementById("mainPlaceholder").classList.remove("visible");
-          document.getElementById("previewSection").style.display = "";
           document.getElementById("sidebarDownloads").style.display = "";
-          await loadPreview();
           renderTextDownloads(latestGroups, jobId);
+          if (!terminalHandled) {
+            terminalHandled = true;
+            await loadPreviewSafely();
+          }
         } else if (status.status === "failed") {
           clearInterval(timer);
           document.getElementById("mainPlaceholder").classList.remove("visible");
@@ -227,6 +237,9 @@
 
     async function loadPreview() {
       const response = await fetch(`/api/jobs/${jobId}/preview`);
+      if (!response.ok) {
+        throw new Error(`\u9884\u89c8\u63a5\u53e3\u8fd4\u56de ${response.status}`);
+      }
       const preview = await response.json();
 
       renderTable("surfaceWaterResults", preview.monitoring_extraction.surface_water_results, "monitoring", jobId);
@@ -238,6 +251,20 @@
       renderNoiseSummary(preview.compliance.noise_summary || {});
       renderLlmTextPolishStatus(preview.llm_text_polish || {});
       renderSchemaFallbackStatus(preview.schema_fallback || {});
+    }
+
+    async function loadPreviewSafely() {
+      try {
+        await loadPreview();
+        document.getElementById("previewSection").style.display = "";
+      } catch (error) {
+        console.error("\u7ed3\u679c\u9884\u89c8\u52a0\u8f7d\u5931\u8d25", error);
+        const banner = document.getElementById("processingBanner");
+        banner.querySelector("strong").textContent = "\u62a5\u544a\u5df2\u751f\u6210\uff0c\u6570\u636e\u9884\u89c8\u52a0\u8f7d\u5931\u8d25";
+        document.getElementById("processingHint").textContent =
+          "\u53ef\u5148\u4e0b\u8f7d\u5b8c\u6574\u62a5\u544a\uff1b\u5237\u65b0\u9875\u9762\u53ef\u91cd\u65b0\u52a0\u8f7d\u6570\u636e\u9884\u89c8\u3002";
+        banner.classList.add("visible");
+      }
     }
 
     function showNotFound(message) {

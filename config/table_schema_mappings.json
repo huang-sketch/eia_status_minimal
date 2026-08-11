@@ -4,11 +4,11 @@
     "noise_plan": {
       "required_fields": ["point_code", "point_name", "position", "standard_class"],
       "aliases": {
-        "point_code": ["编号", "监测点编号", "点位编号"],
+        "point_code": ["编号", "监测点编号", "点位编号", "测点编号"],
         "station": ["桩号", "中心桩号"],
         "point_name": ["监测点名称", "敏感点名称", "敏感目标名称", "名称"],
         "district": ["行政区划", "所在行政区"],
-        "position": ["监测点位置", "点位", "监测位置", "监测楼层", "监测楼层（层）"],
+        "position": ["监测点位置", "点位", "监测位置", "监测楼层", "监测楼层（层）", "点位位置"],
         "standard_class": ["现状标准", "现状执行标准", "声现状执行标准", "声环境现状执行标准", "声环境标准", "噪声执行标准", "标准类别", "执行标准"],
         "factor": ["监测因子"],
         "frequency": ["监测频次", "监测时间", "监测要求"]
@@ -17,9 +17,9 @@
     "noise_result": {
       "required_fields": ["point", "monitor_time", "laeq"],
       "aliases": {
-        "point": ["点位", "检测位置", "监测位置", "监测点位置"],
+        "point": ["点位", "测点", "检测位置", "监测位置", "监测点位置"],
         "monitor_time": ["监测时间", "测量时间", "检测时间"],
-        "laeq": ["LAeq", "区域环境噪声_LAeq", "交通噪声_LAeq"],
+        "laeq": ["LAeq", "等效声级", "等效连续A声级", "区域环境噪声_LAeq", "交通噪声_LAeq"],
         "traffic_flow": ["车流量（辆/20min）", "车流量", "交通量"]
       }
     },
@@ -27,7 +27,7 @@
       "required_fields": ["point_code"],
       "aliases": {
         "point_code": ["序号", "编号", "监测点编号", "点位编号"],
-        "river_name": ["河流名称", "河流", "水体"],
+        "river_name": ["河流名称", "河流", "水体", "水体名称"],
         "position": ["监测点位置", "中心桩号", "桩号"],
         "section_name": ["取样断面", "监测断面", "断面"],
         "standard_class": ["评价标准", "水质目标", "水质类别", "标准类别", "执行标准", "标准"],
@@ -38,7 +38,7 @@
     "surface_water_result": {
       "required_fields": ["point", "sample_date", "factor", "value"],
       "aliases": {
-        "point": ["采样位置", "监测点位置", "检测位置", "点位", "断面"],
+        "point": ["采样位置", "监测断面", "监测点位置", "检测位置", "点位", "断面"],
         "sample_date": ["采样日期", "监测日期", "检测日期", "采样时间"],
         "factor": ["检测项目", "监测项目", "监测因子", "项目"],
         "unit": ["单位"],

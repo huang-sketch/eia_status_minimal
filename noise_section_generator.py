@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from docx import Document
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from docx.shared import Cm, Pt
 
 from docx_layout import (
     HEADER_FILL,
@@ -21,7 +22,6 @@ from docx_layout import (
     add_chapter_title,
     add_landscape_section,
     add_level3_heading,
-    add_portrait_section,
     add_section_heading,
     add_table,
     create_section_document,
@@ -32,6 +32,7 @@ from docx_layout import (
     shade_cell,
 )
 from docx_numbering import DocxNumbering, load_numbering
+from formal_text_skill import build_noise_formal_text_validation, write_formal_text_validation
 from llm_client import (
     LLM_TEXT_BATCH_PAUSE_SECONDS,
     LlmProfile,
@@ -59,6 +60,14 @@ TEXT_POLISH_GUIDANCE_PATH = Path(
 POINT_KEY = "点位"
 TIME_KEY = "监测时间"
 FLOW_KEY = "车流量（辆/20min）"
+ROW_POSITION_MARKER_PATTERN = r"(?:首排|第?[一二三四五六七八九十]+排)"
+ROAD_VEHICLE_KEYS = ("large", "medium", "small")
+ROAD_VEHICLE_LABELS = {"large": "\u5927", "medium": "\u4e2d", "small": "\u5c0f"}
+LEGACY_TRAFFIC_FLOW_FIELDS = (
+    "traffic_flow_day1_day", "traffic_flow_day1_night",
+    "traffic_flow_day2_day", "traffic_flow_day2_night",
+)
+
 DATE_TUPLE = Tuple[int, int, int]
 LAB_NAME_RE = re.compile(
     r"^[\u4e00-\u9fffA-Za-z0-9（）()·\-]{4,80}(?:检测中心|环境监测中心|环境检测中心)$"
@@ -121,6 +130,15 @@ def main() -> None:
 
     texts = build_rule_texts(table1, table2, table3, summary, plan_rows, numbering)
     texts = polish_noise_text_with_llm(texts, table1, table2, table3, summary, numbering)
+    formal_validation = build_noise_formal_text_validation(
+        plan_rows,
+        table1,
+        table2,
+        table3,
+        texts,
+        data_warnings=[*standard_warnings, *plan_meta_warnings, *flow_unit_warnings, *mismatch_warnings, *position_warnings],
+    )
+    write_formal_text_validation(DEBUG_DIR, formal_validation)
 
     doc = build_docx(table1, table2, table3, table_indoor, summary, texts, numbering)
     finalize_section_document(doc)
@@ -242,34 +260,39 @@ def normalize_plan_row(
     defaults: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     defaults = defaults or {}
-    raw_code = cell_value(row, "point_code", "监测点编号", "点位编号", "编号")
+    raw_code = cell_value(row, "point_code", "\u76d1\u6d4b\u70b9\u7f16\u53f7", "\u70b9\u4f4d\u7f16\u53f7", "\u7f16\u53f7")
     code = extract_point_code(raw_code) or raw_code
     raw_standard = cell_value(
         row,
         "standard_class",
-        "现状标准",
-        "现状执行标准",
-        "声现状执行标准",
-        "声环境现状执行标准",
-        "声环境标准",
-        "噪声执行标准",
-        "标准类别",
-        "执行标准",
+        "\u73b0\u72b6\u6807\u51c6",
+        "\u73b0\u72b6\u6267\u884c\u6807\u51c6",
+        "\u58f0\u73b0\u72b6\u6267\u884c\u6807\u51c6",
+        "\u58f0\u73af\u5883\u73b0\u72b6\u6267\u884c\u6807\u51c6",
+        "\u58f0\u73af\u5883\u6807\u51c6",
+        "\u566a\u58f0\u6267\u884c\u6807\u51c6",
+        "\u6807\u51c6\u7c7b\u522b",
+        "\u6267\u884c\u6807\u51c6",
     )
     standard_day, standard_night = parse_custom_noise_standard_limits(raw_standard)
+    raw_frequency = cell_value(row, "frequency", "\u76d1\u6d4b\u9891\u6b21", "\u76d1\u6d4b\u65f6\u95f4", "\u76d1\u6d4b\u8981\u6c42")
+    raw_duration = cell_value(row, "monitor_duration", "\u76d1\u6d4b\u65f6\u957f", "\u5355\u6b21\u76d1\u6d4b\u65f6\u95f4")
+    monitor_duration = extract_noise_monitor_duration(raw_duration or raw_frequency)
+    frequency = strip_noise_monitor_duration(raw_frequency) or defaults.get("frequency", "")
     return {
         "point_code": code,
         "code_detail": extract_code_detail(raw_code),
-        "station": cell_value(row, "station", "桩号"),
-        "point_name": cell_value(row, "point_name", "监测点名称", "敏感目标名称", "名称"),
-        "district": cell_value(row, "district", "行政区划", "所在行政区"),
-        "position": cell_value(row, "position", "监测点位置", "点位", "监测位置"),
+        "station": cell_value(row, "station", "\u6869\u53f7"),
+        "point_name": cell_value(row, "point_name", "\u76d1\u6d4b\u70b9\u540d\u79f0", "\u654f\u611f\u76ee\u6807\u540d\u79f0", "\u540d\u79f0"),
+        "district": cell_value(row, "district", "\u884c\u653f\u533a\u5212", "\u6240\u5728\u884c\u653f\u533a"),
+        "position": cell_value(row, "position", "\u76d1\u6d4b\u70b9\u4f4d\u7f6e", "\u70b9\u4f4d", "\u76d1\u6d4b\u4f4d\u7f6e"),
         "standard_class": normalize_noise_standard_class(raw_standard),
         "standard_class_raw": raw_standard,
         "standard_day": standard_day,
         "standard_night": standard_night,
-        "factor": cell_value(row, "factor", "监测因子") or defaults.get("factor", ""),
-        "frequency": cell_value(row, "frequency", "监测频次", "监测时间", "监测要求") or defaults.get("frequency", ""),
+        "factor": cell_value(row, "factor", "\u76d1\u6d4b\u56e0\u5b50") or defaults.get("factor", ""),
+        "frequency": frequency,
+        "monitor_duration": monitor_duration,
         "is_attenuation": is_attenuation_text(" ".join(str(v) for v in row.values())),
         "source_file": source_file,
         "source_table": source_table,
@@ -589,6 +612,44 @@ def infer_flattened_noise_type(data: Dict[str, Any]) -> str:
     return "area_environment_noise"
 
 
+def parse_road_flow_breakdown(value: Any) -> Dict[str, str]:
+    text = str(value or "").strip()
+    if text in {"", "-", "/", "\u2014", "None", "none", "null"}:
+        return {}
+    parts = [part.strip() for part in re.split(r"[/\uff0f,\uff0c\s]+", text) if part.strip()]
+    if len(parts) != 3:
+        return {}
+    return dict(zip(ROAD_VEHICLE_KEYS, parts))
+
+
+def vehicle_flow_value_from_row(row: Dict[str, Any], vehicle: str) -> str:
+    aliases = {
+        "large": ("\u5927\u578b\u8f66", "\u5927\u8f66"),
+        "medium": ("\u4e2d\u578b\u8f66", "\u4e2d\u8f66"),
+        "small": ("\u5c0f\u578b\u8f66", "\u5c0f\u8f66"),
+    }[vehicle]
+    for key, value in row.items():
+        header = re.sub(r"\s+", "", str(key or ""))
+        if any(alias in header for alias in aliases):
+            return str(value or "").strip()
+    return ""
+
+
+def road_flow_breakdown_from_row(row: Dict[str, Any], raw_flow: Any) -> Dict[str, str]:
+    explicit = {
+        vehicle: vehicle_flow_value_from_row(row, vehicle)
+        for vehicle in ROAD_VEHICLE_KEYS
+    }
+    if any(value not in {"", "-", "/", "\u2014"} for value in explicit.values()):
+        return {vehicle: explicit[vehicle] or "/" for vehicle in ROAD_VEHICLE_KEYS}
+    return parse_road_flow_breakdown(raw_flow)
+
+
+def canonical_road_flow_text(breakdown: Dict[str, str], fallback: Any = "/") -> str:
+    if not breakdown:
+        return str(fallback or "/")
+    return "/".join(str(breakdown.get(vehicle) or "/") for vehicle in ROAD_VEHICLE_KEYS)
+
 def parse_flattened_noise_records(data: Dict[str, Any], noise_type: str, table_order: int = 9999) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     raw_records = data.get("records") or []
@@ -622,6 +683,13 @@ def parse_flattened_noise_records(data: Dict[str, Any], noise_type: str, table_o
         raw_point_code = extract_point_code(point_text)
         if not raw_point_code and not has_noise_point_identity(point_text):
             continue
+        raw_flow = row.get(FLOW_KEY) or row.get(flow_key) or "/"
+        explicit_vehicle_flow = any(
+            vehicle_flow_value_from_row(row, vehicle) not in {"", "-", "/", "\u2014"}
+            for vehicle in ROAD_VEHICLE_KEYS
+        )
+        flow_breakdown = road_flow_breakdown_from_row(row, raw_flow) if "\u8f66" in flow_unit or explicit_vehicle_flow else {}
+        traffic_flow = canonical_road_flow_text(flow_breakdown, raw_flow)
         records.append(
             {
                 "noise_type": noise_type,
@@ -631,7 +699,10 @@ def parse_flattened_noise_records(data: Dict[str, Any], noise_type: str, table_o
                 "period": infer_period(row.get(time_key) or ""),
                 "laeq": row.get(laeq_key),
                 "laeq_key": laeq_key,
-                "traffic_flow": row.get(flow_key) or "/",
+                "traffic_flow": traffic_flow,
+                "traffic_flow_large": flow_breakdown.get("large", "/"),
+                "traffic_flow_medium": flow_breakdown.get("medium", "/"),
+                "traffic_flow_small": flow_breakdown.get("small", "/"),
                 "traffic_flow_unit": flow_unit,
                 "noise_factor_items": factor_items,
                 "source_headers": headers,
@@ -645,7 +716,10 @@ def parse_flattened_noise_records(data: Dict[str, Any], noise_type: str, table_o
 
 def apply_noise_result_meta_to_plan_rows(plan_rows: List[Dict[str, Any]], records: List[Dict[str, Any]]) -> None:
     factor = infer_noise_factor_from_records(records)
-    frequency = compact_noise_frequency(next((row.get("frequency") for row in plan_rows if row.get("frequency")), ""))
+    frequency = infer_noise_frequency_from_records(
+        records,
+        [str(row.get("frequency") or "") for row in plan_rows if row.get("frequency")],
+    )
     status_path = DEBUG_DIR / "noise_plan_meta_status.json"
     status = read_json(status_path) if status_path.exists() else {}
     status.setdefault("result_header_rule", {})
@@ -661,7 +735,9 @@ def apply_noise_result_meta_to_plan_rows(plan_rows: List[Dict[str, Any]], record
     status["final"] = {
         "factor": factor or next((row.get("factor") for row in plan_rows if row.get("factor")), ""),
         "frequency": frequency or next((row.get("frequency") for row in plan_rows if row.get("frequency")), ""),
+        "monitor_durations": sorted({str(row.get("monitor_duration") or "") for row in plan_rows if row.get("monitor_duration")}),
     }
+    status["frequency_rule"] = build_noise_frequency_status(records, frequency)
     write_json(DEBUG_DIR / "noise_plan_meta_status.json", status)
 
 
@@ -688,6 +764,35 @@ def noise_factor_items_from_headers(headers: List[str]) -> List[str]:
     return items
 
 
+def extract_noise_monitor_duration(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    if re.search(r"\u4e0d(?:\u5c0f|\u5c11)\u4e8e\s*1\s*h", text, flags=re.IGNORECASE):
+        return "\u4e0d\u5c0f\u4e8e1h"
+    match = re.search(r"(?:\u6bcf\u6b21(?:\u6d4b\u91cf|\u76d1\u6d4b)?(?:\u65f6\u95f4)?(?:\u4e0d(?:\u5c0f|\u5c11)\u4e8e)?\s*)?(\d+(?:\.\d+)?)\s*(min|\u5206\u949f|h|\u5c0f\u65f6)", text, flags=re.IGNORECASE)
+    if not match:
+        return ""
+    number = match.group(1)
+    unit = match.group(2).lower()
+    if unit in {"min", "\u5206\u949f"}:
+        return f"{number}min"
+    if unit in {"h", "\u5c0f\u65f6"}:
+        return f"{number}h"
+    return ""
+
+
+def strip_noise_monitor_duration(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"(?:\uff1b|;|\uff0c|,)?\s*\u6bcf\u6b21(?:\u6d4b\u91cf|\u76d1\u6d4b)?(?:\u65f6\u95f4)?(?:\u4e0d(?:\u5c0f|\u5c11)\u4e8e)?\s*\d+(?:\.\d+)?\s*(?:min|\u5206\u949f|h|\u5c0f\u65f6)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?:\u4e0d(?:\u5c0f|\u5c11)\u4e8e)?\s*\d+(?:\.\d+)?\s*(?:min|\u5206\u949f|h|\u5c0f\u65f6)", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[\uff0c,\uff1b;\uff1a:]?\s*(?:\u8be6\u89c1)?\u8868\d+[^\u3002\uff1b;]*\u76d1\u6d4b\u65f6\u95f4[^\u3002\uff1b;]*", "", text)
+    text = re.sub(r"\s+", "", text).strip("\uff0c,\uff1b;\u3002")
+    return compact_noise_frequency(text) if text else ""
+
+
 def compact_noise_frequency(value: str) -> str:
     text = str(value or "")
     if not text:
@@ -701,11 +806,37 @@ def compact_noise_frequency(value: str) -> str:
     return text
 
 
+def infer_noise_frequency_from_records(records: List[Dict[str, Any]], plan_frequencies: List[str]) -> str:
+    noise_types = {str(record.get("noise_type") or "") for record in records}
+    flow_labels = {
+        canonical_flow_label(record.get("traffic_flow_unit"))
+        for record in records
+        if has_record_traffic_flow(record)
+    }
+    if noise_types or flow_labels:
+        return "\u76d1\u6d4b2\u5929\uff0c\u663c\u3001\u591c\u95f4\u5404\u76d1\u6d4b1\u6b21\u3002"
+    first_frequency = next((item for item in plan_frequencies if item), "")
+    return strip_noise_monitor_duration(first_frequency) or compact_noise_frequency(first_frequency)
+
+
+def build_noise_frequency_status(records: List[Dict[str, Any]], final_frequency: str) -> Dict[str, Any]:
+    return {
+        "noise_types": sorted({str(record.get("noise_type") or "") for record in records if record.get("noise_type")}),
+        "flow_units": sorted(
+            {
+                canonical_flow_label(record.get("traffic_flow_unit"))
+                for record in records
+                if has_record_traffic_flow(record)
+            }
+        ),
+        "final_frequency": final_frequency,
+        "source": "result_type_and_plan_rule",
+    }
+
+
 def flow_label_from_header(header: str) -> str:
     text = str(header or "").strip()
-    if not text or text == FLOW_KEY:
-        return "车流量（辆/20min）"
-    return text
+    return canonical_flow_label(text) or "车流量（辆/20min）"
 
 
 def has_noise_point_identity(text: str) -> bool:
@@ -716,7 +847,11 @@ def has_noise_point_identity(text: str) -> bool:
 
 
 def build_monitor_points_table(plan_rows: List[Dict[str, Any]], records: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    headers = ["监测点编号", "桩号", "监测点名称", "行政区划", "监测点位置", "现状标准", "监测因子", "监测频次"]
+    headers = ["\u76d1\u6d4b\u70b9\u7f16\u53f7", "\u6869\u53f7", "\u76d1\u6d4b\u70b9\u540d\u79f0", "\u884c\u653f\u533a\u5212", "\u76d1\u6d4b\u70b9\u4f4d\u7f6e", "\u73b0\u72b6\u6807\u51c6", "\u76d1\u6d4b\u56e0\u5b50", "\u76d1\u6d4b\u9891\u6b21"]
+    duration_values = sorted({re.sub(r"\s+", "", str(row.get("monitor_duration") or "")) for row in plan_rows if row.get("monitor_duration")})
+    include_monitor_time = len(duration_values) >= 2
+    if include_monitor_time:
+        headers.append("\u76d1\u6d4b\u65f6\u95f4")
     plan_records = first_record_by_plan_row(records or [], plan_rows)
     rows = []
     debug_rows = []
@@ -724,41 +859,44 @@ def build_monitor_points_table(plan_rows: List[Dict[str, Any]], records: Optiona
         record = plan_records.get(id(row))
         final_name = monitor_point_display_name(row, record)
         final_position = monitor_point_display_position(row, record)
-        rows.append(
-            {
-                "监测点编号": row["point_code"],
-                "桩号": row["station"],
-                "监测点名称": final_name,
-                "行政区划": row["district"],
-                "监测点位置": final_position,
-                "现状标准": noise_standard_display(row),
-                "监测因子": row["factor"],
-                "监测频次": row["frequency"],
-            }
-        )
+        row_payload = {
+            "\u76d1\u6d4b\u70b9\u7f16\u53f7": row["point_code"],
+            "\u6869\u53f7": row["station"],
+            "\u76d1\u6d4b\u70b9\u540d\u79f0": final_name,
+            "\u884c\u653f\u533a\u5212": row["district"],
+            "\u76d1\u6d4b\u70b9\u4f4d\u7f6e": final_position,
+            "\u73b0\u72b6\u6807\u51c6": noise_standard_display(row),
+            "\u76d1\u6d4b\u56e0\u5b50": row["factor"],
+            "\u76d1\u6d4b\u9891\u6b21": row["frequency"],
+        }
+        if include_monitor_time:
+            row_payload["\u76d1\u6d4b\u65f6\u95f4"] = row.get("monitor_duration") or "-"
+        rows.append(row_payload)
         debug_rows.append(
             {
                 "point_code": row.get("point_code"),
                 "raw_plan_name": row.get("point_name"),
                 "raw_plan_position": row.get("position"),
                 "raw_report_point": (record or {}).get("point_text"),
+                "position_source": "plan_complete" if complete_floor_position_from_plan(str(row.get("position") or "")) else "report_fallback",
+                "monitor_duration": row.get("monitor_duration"),
                 "final_name": final_name,
                 "final_position": final_position,
             }
         )
-    if not any(str(row.get("行政区划") or "").strip() for row in rows):
-        headers = [header for header in headers if header != "行政区划"]
+    if not any(str(row.get("\u884c\u653f\u533a\u5212") or "").strip() for row in rows):
+        headers = [header for header in headers if header != "\u884c\u653f\u533a\u5212"]
         for row in rows:
-            row.pop("行政区划", None)
-    if all(is_blank_table_value(row.get("桩号")) for row in rows):
-        headers = [header for header in headers if header != "桩号"]
+            row.pop("\u884c\u653f\u533a\u5212", None)
+    if all(is_blank_table_value(row.get("\u6869\u53f7")) for row in rows):
+        headers = [header for header in headers if header != "\u6869\u53f7"]
         for row in rows:
-            row.pop("桩号", None)
+            row.pop("\u6869\u53f7", None)
     write_json(DEBUG_DIR / "noise_monitor_points_name_position_debug.json", debug_rows)
     return {
         "table_key": NOISE_TABLE_MONITOR_POINTS,
-        "caption_suffix": "声环境质量现状监测点",
-        "title": "声环境质量现状监测点",
+        "caption_suffix": "\u58f0\u73af\u5883\u8d28\u91cf\u73b0\u72b6\u76d1\u6d4b\u70b9",
+        "title": "\u58f0\u73af\u5883\u8d28\u91cf\u73b0\u72b6\u76d1\u6d4b\u70b9",
         "headers": headers,
         "rows": rows,
     }
@@ -779,6 +917,8 @@ def first_record_by_plan_row(records: List[Dict[str, Any]], plan_rows: List[Dict
 
 
 def monitor_point_display_name(plan: Dict[str, Any], record: Optional[Dict[str, Any]]) -> str:
+    if is_railway_boundary_point_name(plan.get("point_name")):
+        return str(plan.get("point_name") or "").strip()
     if plan.get("is_attenuation"):
         return clean_attenuation_point_name(plan, record)
     candidates = [
@@ -798,16 +938,29 @@ def monitor_point_display_name(plan: Dict[str, Any], record: Optional[Dict[str, 
 def monitor_point_display_position(plan: Dict[str, Any], record: Optional[Dict[str, Any]]) -> str:
     if plan.get("is_attenuation"):
         return clean_attenuation_point_position(plan, record)
-    report_position = ""
-    if record:
-        _name, report_position = split_monitor_point_identity(record.get("point_text"), plan, record)
-    plan_position = str(plan.get("position") or "").strip()
-    position = build_monitor_point_position(plan_position, report_position)
-    if position:
-        return position
-    if re.fullmatch(r"\d+", plan_position):
-        return f"{plan_position}层"
-    return first_floor_position_from_plan(plan_position) or plan_position or "-"
+    return compose_plan_monitor_position(
+        plan.get("position"),
+        (record or {}).get("point_text"),
+    )
+
+
+def compose_plan_monitor_position(plan_position: Any, report_text: Any) -> str:
+    plan_text = str(plan_position or "").strip()
+    report_value = str(report_text or "").strip()
+    report_floor = extract_floor_position_fragment(report_value)
+    if report_floor:
+        context = strip_plan_floor_terms(plan_text)
+        marker = (
+            "室外" if "室外" in report_value or "室外" in plan_text
+            else "室内" if "室内" in report_value or "室内" in plan_text
+            else ""
+        )
+        floor = apply_indoor_outdoor_marker(report_floor, marker)
+        context = context.replace("室外", "").replace("室内", "").strip()
+        return normalize_floor_position_display(f"{context}{floor}" if context else floor)
+    if plan_text:
+        return normalize_display_position(plan_text)
+    return normalize_display_position(report_value) if report_value else "-"
 
 
 def clean_monitor_point_object_name(
@@ -827,7 +980,7 @@ def clean_monitor_point_object_name(
         text = text.replace(station, "")
     text = re.sub(r"K\s*\d+\s*[+-]\s*\d+", "", text, flags=re.IGNORECASE)
     text = re.sub(r"点位编号\s*[A-Za-z]*\d+(?:-\d+)?", "", text, flags=re.IGNORECASE)
-    text = re.split(r"(?:面向|背向|距离|距|首排|第二排|道路红线|道路中心线|公路中心线|铁路|陇海线)", text, maxsplit=1)[0]
+    text = re.split(rf"(?:面向|背向|距离|距|{ROW_POSITION_MARKER_PATTERN}|道路红线|道路中心线|公路中心线|铁路|陇海线)", text, maxsplit=1)[0]
     text = re.sub(r"\d+(?:\.\d+)?\s*m", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\d+\s*[层楼](?:室外|室内)?(?:监测)?", "", text)
     text = re.sub(r"(?:室外|室内)\s*(?:监测|噪声监测)?", "", text)
@@ -841,31 +994,32 @@ def build_monitor_point_position(plan_position: str, report_position: str) -> st
     plan_text = str(plan_position or "").strip()
     report_text = str(report_position or "").strip()
     for source in (report_text, plan_text):
-        if has_orientation_marker(source) and re.search(r"\d+\s*[层楼]", source):
+        if has_orientation_marker(source) and (re.search(r"\d+\s*[层楼]", source) or is_plain_floor_position(source)):
             return normalize_display_position(source)
     orientation = extract_orientation_context(report_text) or extract_orientation_context(plan_text)
     floor = extract_floor_position_fragment(report_text) or first_floor_position_from_plan(plan_text)
     if orientation and floor:
-        return f"{orientation} {floor}"
+        return normalize_floor_position_display(f"{orientation} {floor}")
     if orientation:
-        return orientation
+        return normalize_floor_position_display(orientation)
     if floor:
-        return floor
-    return normalize_display_position(report_text or plan_text)
+        return normalize_floor_position_display(floor)
+    return normalize_floor_position_display(normalize_display_position(report_text or plan_text))
 
 
 def extract_orientation_context(text: str) -> str:
     value = str(text or "")
     match = re.search(
-        r"(面向[^，,；;。]*?(?:首排|第二排|本项目|道路|公路|铁路)|背向[^，,；;。]*?(?:首排|第二排|本项目|道路|公路|铁路))",
+        rf"(面向[^，,；;。]*?(?:{ROW_POSITION_MARKER_PATTERN}|本项目|道路|公路|铁路)|背向[^，,；;。]*?(?:{ROW_POSITION_MARKER_PATTERN}|本项目|道路|公路|铁路))",
         value,
     )
     if match:
         result = re.sub(r"\d+\s*[层楼](?:室外|室内)?(?:监测)?", "", match.group(1))
         result = re.sub(r"\s+", "", result).strip("、，,;；。")
         return result
-    if "首排" in value:
-        return "面向本项目首排" if "本项目" in value or "面向" in value else "首排"
+    row_marker = re.search(ROW_POSITION_MARKER_PATTERN, value)
+    if row_marker:
+        return f"面向本项目{row_marker.group(0)}" if "本项目" in value or "面向" in value else row_marker.group(0)
     return ""
 
 
@@ -873,7 +1027,30 @@ def normalize_display_position(text: str) -> str:
     value = normalize_position_text(str(text or ""))
     value = re.sub(r"\s+", "", value).strip("、，,;；。")
     value = re.sub(r"(面向[^，,；;。]*?)(\d+\s*[层楼])", r"\1 \2", value)
-    return value
+    return normalize_floor_position_display(value)
+
+
+def normalize_floor_position_display(value: Any) -> str:
+    text = re.sub(r"\s+", "", str(value or "")).strip("、，,;；。")
+    if not text or text == "-":
+        return text
+    text = text.replace("楼", "层")
+    if re.fullmatch(r"\d+", text):
+        return f"{text}层"
+    match = re.fullmatch(r"(\d+)(室外|室内)", text)
+    if match:
+        return f"{match.group(1)}层{match.group(2)}"
+    if has_orientation_marker(text) and "m" not in text.lower() and "米" not in text and not re.search(r"\d+\s*层", text):
+        text = re.sub(r"(\d+)(室外|室内)?$", lambda m: f"{m.group(1)}层{m.group(2) or ''}", text)
+    text = re.sub(r"(\d+)层层", r"\1层", text)
+    return text
+
+
+def is_plain_floor_position(value: Any) -> bool:
+    text = re.sub(r"\s+", "", str(value or "")).strip("、，,;；。")
+    if re.fullmatch(r"\d+(?:室外|室内)?", text):
+        return True
+    return bool(has_orientation_marker(text) and "m" not in text.lower() and "米" not in text and re.search(r"\d+(?:室外|室内)?$", text))
 
 
 def clean_attenuation_point_name(plan: Dict[str, Any], record: Optional[Dict[str, Any]]) -> str:
@@ -920,6 +1097,11 @@ def clean_attenuation_position_text(value: Any, raw_code: str, station: str, poi
 
 
 def clean_result_table_point_name(record: Dict[str, Any], plan: Dict[str, Any]) -> str:
+    if is_railway_boundary_point_name(plan.get("point_name")):
+        return str(plan.get("point_name") or "").strip()
+    display_name = monitor_point_display_name(plan, record)
+    if display_name and display_name != "-":
+        return display_name
     for source in (plan.get("point_name"), record.get("point_text"), result_name_for_record(record, plan)):
         name = clean_monitor_point_object_name(source, plan, record)
         if name:
@@ -971,11 +1153,12 @@ def build_sensitive_result_table(
         type_records = [record for record in records if record.get("noise_type") in source_types]
         if not type_records:
             continue
-        subtable = build_sensitive_result_subtable(type_records, plan_rows, noise_type)
-        if subtable.get("rows"):
-            subtables.append(subtable)
-            all_rows.extend(subtable["rows"])
-            all_warnings.extend(subtable.get("warnings") or [])
+        for subtable_noise_type, subtable_records in split_sensitive_records_by_flow_unit(noise_type, type_records):
+            subtable = build_sensitive_result_subtable(subtable_records, plan_rows, subtable_noise_type)
+            if subtable.get("rows"):
+                subtables.append(subtable)
+                all_rows.extend(subtable["rows"])
+                all_warnings.extend(subtable.get("warnings") or [])
     if not subtables:
         subtable = build_sensitive_result_subtable(records, plan_rows, "area_environment_noise")
         subtables.append(subtable)
@@ -985,7 +1168,7 @@ def build_sensitive_result_table(
         "table_key": NOISE_TABLE_SENSITIVE,
         "caption_suffix": "项目沿线敏感点声环境现状监测平均值  单位：dB(A)",
         "title": "项目沿线敏感点声环境现状监测平均值  单位：dB(A)",
-        "headers": result_headers(include_flow=has_traffic_flow(all_rows)),
+        "headers": result_headers(include_flow=has_traffic_flow(all_rows), vehicle_breakdown=has_vehicle_flow_breakdown(all_rows)),
         "rows": all_rows,
         "subtables": subtables,
         "flow_label": flow_label_from_rows(all_rows),
@@ -1017,6 +1200,7 @@ def build_sensitive_result_subtable(
         row["traffic_flow_day2_day"] = flow_text(flows, 1, "day")
         row["traffic_flow_day2_night"] = flow_text(flows, 1, "night")
         row["_flow_label"] = flow_label_from_records(point_records)
+        add_vehicle_flow_fields(row, flows)
         row["noise_type"] = noise_type
         row["noise_type_label"] = noise_type_label(noise_type)
         row["noise_types"] = sorted({record["noise_type"] for record in point_records})
@@ -1028,7 +1212,7 @@ def build_sensitive_result_subtable(
     include_flow = has_traffic_flow(rows)
     if not include_flow:
         strip_traffic_flow_fields(rows)
-    headers = result_headers(include_flow=include_flow)
+    headers = result_headers(include_flow=include_flow, vehicle_breakdown=has_vehicle_flow_breakdown(rows))
     return {
         "table_key": f"{NOISE_TABLE_SENSITIVE}_{noise_type}",
         "caption_suffix": f"{noise_type_label(noise_type)}监测结果  单位：dB(A)",
@@ -1043,12 +1227,35 @@ def build_sensitive_result_subtable(
     }
 
 
+def split_sensitive_records_by_flow_unit(
+    noise_type: str,
+    records: List[Dict[str, Any]],
+) -> List[Tuple[str, List[Dict[str, Any]]]]:
+    if noise_type != "area_traffic_noise":
+        return [(noise_type, records)]
+    road_or_area: List[Dict[str, Any]] = []
+    rail_flow: List[Dict[str, Any]] = []
+    for record in records:
+        label = canonical_flow_label(record.get("traffic_flow_unit"))
+        if has_record_traffic_flow(record) and "列/60min" in label:
+            rail_flow.append(record)
+        else:
+            road_or_area.append(record)
+    result: List[Tuple[str, List[Dict[str, Any]]]] = []
+    if road_or_area:
+        result.append(("area_traffic_noise", road_or_area))
+    if rail_flow:
+        result.append(("area_traffic_train_flow_noise", rail_flow))
+    return result
+
+
 def noise_type_label(noise_type: str) -> str:
     return {
         "railway_boundary_noise": "铁路边界噪声",
         "traffic_noise": "交通噪声",
         "area_environment_noise": "区域环境噪声",
         "area_traffic_noise": "区域环境及交通噪声",
+        "area_traffic_train_flow_noise": "列车经过交通噪声",
     }.get(noise_type, "声环境噪声")
 
 
@@ -1076,6 +1283,7 @@ def build_attenuation_result_table(
         row["traffic_flow_day2_day"] = flow_text(flows, 1, "day")
         row["traffic_flow_day2_night"] = flow_text(flows, 1, "night")
         row["_flow_label"] = flow_label_from_records(point_records)
+        add_vehicle_flow_fields(row, flows)
         row["needs_review"] = bool(metrics.get("warnings"))
         row["warning"] = "；".join(metrics.get("warnings") or [])
         rows.append(row)
@@ -1084,7 +1292,7 @@ def build_attenuation_result_table(
     include_flow = has_traffic_flow(rows)
     if not include_flow:
         strip_traffic_flow_fields(rows)
-    headers = result_headers(include_flow=include_flow)
+    headers = result_headers(include_flow=include_flow, vehicle_breakdown=has_vehicle_flow_breakdown(rows))
     return {
         "table_key": NOISE_TABLE_ATTENUATION,
         "caption_suffix": "现状公路交通噪声衰减断面监测结果  单位：dB(A)",
@@ -1179,7 +1387,7 @@ def build_indoor_result_table(table2: Dict[str, Any]) -> Dict[str, Any]:
             strip_traffic_flow_fields(subtable_outdoor_rows)
         updated_subtable = dict(subtable)
         updated_subtable["rows"] = subtable_outdoor_rows
-        updated_subtable["headers"] = result_headers(include_flow=include_subtable_flow)
+        updated_subtable["headers"] = result_headers(include_flow=include_subtable_flow, vehicle_breakdown=has_vehicle_flow_breakdown(subtable_outdoor_rows))
         updated_subtable["flow_label"] = flow_label_from_rows(subtable_outdoor_rows)
         updated_subtable["warnings"] = [
             warning
@@ -1195,7 +1403,7 @@ def build_indoor_result_table(table2: Dict[str, Any]) -> Dict[str, Any]:
     include_flow = has_traffic_flow(outdoor_rows_all)
     if not include_flow:
         strip_traffic_flow_fields(outdoor_rows_all)
-    table2["headers"] = result_headers(include_flow=include_flow)
+    table2["headers"] = result_headers(include_flow=include_flow, vehicle_breakdown=has_vehicle_flow_breakdown(outdoor_rows_all))
     table2["flow_label"] = flow_label_from_rows(outdoor_rows_all)
     table2["warnings"] = outdoor_warnings
 
@@ -1206,7 +1414,7 @@ def build_indoor_result_table(table2: Dict[str, Any]) -> Dict[str, Any]:
         "table_key": NOISE_TABLE_INDOOR,
         "caption_suffix": "室内噪声监测结果统计  单位：dB(A)",
         "title": "室内噪声监测结果统计  单位：dB(A)",
-        "headers": result_headers(include_flow=include_indoor_flow),
+        "headers": result_headers(include_flow=include_indoor_flow, vehicle_breakdown=has_vehicle_flow_breakdown(indoor_rows)),
         "rows": indoor_rows,
         "flow_label": flow_label_from_rows(indoor_rows),
         "warnings": [
@@ -1221,7 +1429,7 @@ def flow_label_from_records(records: List[Dict[str, Any]]) -> str:
     labels = []
     for record in records:
         value = str(record.get("traffic_flow") or "").strip()
-        label = str(record.get("traffic_flow_unit") or "").strip()
+        label = canonical_flow_label(record.get("traffic_flow_unit"))
         if value and value not in {"-", "/", "—", "无", "None", "none", "null"} and label and label not in labels:
             labels.append(label)
     if len(labels) == 1:
@@ -1234,7 +1442,7 @@ def flow_label_from_records(records: List[Dict[str, Any]]) -> str:
 def flow_label_from_rows(rows: List[Dict[str, Any]]) -> str:
     labels = []
     for row in rows:
-        label = str(row.get("_flow_label") or "").strip()
+        label = canonical_flow_label(row.get("_flow_label"))
         if label and label not in labels:
             labels.append(label)
     if len(labels) == 1:
@@ -1244,16 +1452,45 @@ def flow_label_from_rows(rows: List[Dict[str, Any]]) -> str:
     return "车流量（辆/20min）"
 
 
+def has_record_traffic_flow(record: Dict[str, Any]) -> bool:
+    value = str(record.get("traffic_flow") or "").strip()
+    return value not in {"", "-", "/", "—", "无", "None", "none", "null"}
+
+
+def canonical_flow_label(label: Any) -> str:
+    text = re.sub(r"\s+", "", str(label or ""))
+    if not text:
+        return ""
+    if "列/60min" in text or "列车流量" in text or "列车" in text:
+        return "列车流量（列/60min）"
+    if "辆/20min" in text or "车流量" in text:
+        return "车流量（辆/20min）"
+    return str(label or "").strip()
+
+
 def build_flow_unit_warnings(records: List[Dict[str, Any]]) -> List[str]:
     labels = sorted(
         {
-            str(record.get("traffic_flow_unit") or "").strip()
+            canonical_flow_label(record.get("traffic_flow_unit"))
             for record in records
-            if str(record.get("traffic_flow") or "").strip() not in {"", "-", "/", "—", "无", "None", "none", "null"}
-            and str(record.get("traffic_flow_unit") or "").strip()
+            if has_record_traffic_flow(record)
+            and canonical_flow_label(record.get("traffic_flow_unit"))
         }
     )
-    write_json(DEBUG_DIR / "noise_flow_unit_status.json", {"labels": labels})
+    groups: Dict[str, int] = {}
+    raw_labels: Dict[str, List[str]] = {}
+    for record in records:
+        if not has_record_traffic_flow(record):
+            continue
+        label = canonical_flow_label(record.get("traffic_flow_unit"))
+        if not label:
+            continue
+        groups[label] = groups.get(label, 0) + 1
+        raw = str(record.get("traffic_flow_unit") or "").strip()
+        raw_labels.setdefault(label, [])
+        if raw and raw not in raw_labels[label]:
+            raw_labels[label].append(raw)
+    write_json(DEBUG_DIR / "noise_flow_unit_status.json", {"labels": labels, "groups": groups, "raw_labels": raw_labels})
     if len(labels) > 1:
         return ["噪声监测结果存在多个交通量单位: " + "、".join(labels)]
     return []
@@ -1264,7 +1501,22 @@ def is_indoor_result_row(row: Dict[str, Any]) -> bool:
     return "室内" in position
 
 
-def result_headers(include_flow: bool = True) -> List[str]:
+def road_vehicle_flow_headers() -> List[str]:
+    return [
+        f"{base}_{vehicle}"
+        for base in LEGACY_TRAFFIC_FLOW_FIELDS
+        for vehicle in ROAD_VEHICLE_KEYS
+    ]
+
+
+def has_vehicle_flow_breakdown(rows: List[Dict[str, Any]]) -> bool:
+    empty_values = {"", "-", "/", "\u2014", "None", "none", "null"}
+    return any(
+        str(row.get(header) or "").strip() not in empty_values
+        for row in rows for header in road_vehicle_flow_headers()
+    )
+
+def result_headers(include_flow: bool = True, vehicle_breakdown: bool = False) -> List[str]:
     headers = [
         "监测点编号",
         "监测点名称",
@@ -1280,6 +1532,9 @@ def result_headers(include_flow: bool = True) -> List[str]:
         "exceed_day",
         "exceed_night",
     ]
+    if include_flow and vehicle_breakdown:
+        headers.extend(road_vehicle_flow_headers())
+        return headers
     if include_flow:
         headers.extend(
             [
@@ -1316,6 +1571,8 @@ def strip_traffic_flow_fields(rows: List[Dict[str, Any]]) -> None:
             "traffic_flow_day2_day",
             "traffic_flow_day2_night",
         ):
+            row.pop(header, None)
+        for header in road_vehicle_flow_headers():
             row.pop(header, None)
 
 
@@ -1418,6 +1675,31 @@ def build_plan_report_position_warnings(
             warnings.append(
                 f"{code} 监测方案楼层({format_floor_tokens(plan_floors)})"
                 f"与监测报告楼层({format_floor_tokens(report_floors)})不一致"
+            )
+    for plan in plan_rows:
+        if plan.get("is_attenuation"):
+            continue
+        code = str(plan.get("point_code") or "").strip()
+        matching_record = next(
+            (
+                record for record in records
+                if str(record.get("raw_point_code") or "").strip() == code
+                and "\u80cc\u666f\u70b9" not in str(record.get("point_text") or "")
+            ),
+            None,
+        )
+        if matching_record is None:
+            continue
+        plan_context = strip_plan_floor_terms(str(plan.get("position") or ""))
+        plan_context = plan_context.replace("\u5ba4\u5916", "").replace("\u5ba4\u5185", "").strip()
+        if not plan_context:
+            continue
+        final_position = monitor_point_display_position(plan, matching_record)
+        normalized_context = re.sub(r"\s+", "", normalize_position_text(plan_context))
+        normalized_final = re.sub(r"\s+", "", normalize_position_text(final_position))
+        if normalized_context not in normalized_final:
+            warnings.append(
+                f"{code} \u6700\u7ec8\u76d1\u6d4b\u70b9\u4f4d\u7f6e\u672a\u4fdd\u7559\u65b9\u6848\u4f4d\u7f6e\u5173\u7cfb: {plan_context}"
             )
     return warnings
 
@@ -1698,31 +1980,15 @@ def extract_report_sample_code(text: str) -> str:
 
 def result_position_for_record(record: Dict[str, Any], plan: Dict[str, Any]) -> str:
     point_text = str(record.get("point_text") or "")
-    raw_code = str(record.get("raw_point_code") or "")
     marker, _marker_source = record_indoor_outdoor_marker(record, plan)
     if is_background_record(record):
         return apply_indoor_outdoor_marker(background_position_for_record(record, plan), marker)
     report_position = extract_position_from_point_text(point_text, record, plan)
-    if report_position:
-        report_position = apply_indoor_outdoor_marker(report_position, marker)
-    if has_indoor_outdoor_marker(report_position):
-        return report_position
-    if report_position and has_orientation_marker(report_position):
-        return report_position
-    if report_position:
-        return enrich_floor_position_with_plan_context(report_position, plan)
-    plan_positions = split_floor_positions(str(plan.get("position") or ""))
-    if raw_code and "-" in raw_code and plan_positions:
-        try:
-            sub_index = int(raw_code.rsplit("-", 1)[1]) - 1
-        except ValueError:
-            sub_index = -1
-        if 0 <= sub_index < len(plan_positions):
-            return apply_indoor_outdoor_marker(plan_positions[sub_index], marker)
-    floor_position = extract_floor_position(point_text)
-    if floor_position:
-        return apply_indoor_outdoor_marker(enrich_floor_position_with_plan_context(floor_position, plan), marker)
-    return apply_indoor_outdoor_marker(plan.get("position") or point_text or "-", marker)
+    position = compose_plan_monitor_position(
+        plan.get("position"),
+        report_position or point_text,
+    )
+    return apply_indoor_outdoor_marker(position, marker)
 
 
 def clean_result_point_name(record: Dict[str, Any], plan: Dict[str, Any]) -> str:
@@ -1730,6 +1996,8 @@ def clean_result_point_name(record: Dict[str, Any], plan: Dict[str, Any]) -> str
 
 
 def sanitize_result_point_name(value: Any, plan: Dict[str, Any]) -> str:
+    if is_railway_boundary_point_name(plan.get("point_name")):
+        return str(plan.get("point_name") or "").strip()
     text = str(value or "").strip()
     if not text:
         return ""
@@ -1742,18 +2010,22 @@ def sanitize_result_point_name(value: Any, plan: Dict[str, Any]) -> str:
     text = re.sub(r"K\s*\d+\s*[+-]\s*\d+", "", text, flags=re.IGNORECASE)
     text = re.sub(r"点位编号\s*[A-Za-z]\d+(?:-\d+)?", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\d+\s*[层楼](?:室外|室内)?(?:监测)?", "", text)
-    text = re.sub(r"(?:面向|背向)[^，。；;\r\n]*?(?:首排|第二排|本项目|道路|铁路|陇海线)[^，。；;\r\n]*", "", text)
+    text = re.sub(rf"(?:面向|背向)[^，。；;\r\n]*?(?:{ROW_POSITION_MARKER_PATTERN}|本项目|道路|铁路|陇海线)[^，。；;\r\n]*", "", text)
     text = re.sub(r"(?:敏感点|背景点|衰减断面|室外监测|室内监测|噪声监测)", "", text)
     text = re.sub(r"\s+", " ", text).strip(" 、，,;；")
     return text.strip()
 
 
+def is_railway_boundary_point_name(value: Any) -> bool:
+    return "铁路边界" in str(value or "")
+
+
 def clean_result_position(value: Any, record: Dict[str, Any], plan: Dict[str, Any]) -> str:
-    _report_name, report_position = split_monitor_point_identity(record.get("point_text"), plan, record)
     marker, _marker_source = record_indoor_outdoor_marker(record, plan)
-    if report_position and not is_background_record(record):
-        return apply_indoor_outdoor_marker(report_position, marker)
     text = str(value or "").strip()
+    if not text:
+        _report_name, report_position = split_monitor_point_identity(record.get("point_text"), plan, record)
+        text = report_position
     if not text:
         return "-"
     point_text = str(record.get("point_text") or "")
@@ -1768,10 +2040,10 @@ def clean_result_position(value: Any, record: Dict[str, Any], plan: Dict[str, An
     text = normalize_position_text(text)
     text = re.sub(r"\s+", "", text).strip("、，,;；")
     if is_background_record(record):
-        return apply_indoor_outdoor_marker(append_background_marker(extract_floor_position_fragment(text) or text), marker)
+        return normalize_floor_position_display(apply_indoor_outdoor_marker(append_background_marker(extract_floor_position_fragment(text) or text), marker))
     if not has_orientation_marker(text):
         text = extract_floor_position_fragment(text) or text
-    return apply_indoor_outdoor_marker(text or "-", marker)
+    return normalize_floor_position_display(apply_indoor_outdoor_marker(text or "-", marker))
 
 
 def extract_position_from_point_text(text: str, record: Dict[str, Any], plan: Dict[str, Any]) -> str:
@@ -1784,7 +2056,7 @@ def extract_position_from_point_text(text: str, record: Dict[str, Any], plan: Di
     cleaned = re.sub(r"点位编号\s*[A-Za-z]*\d+(?:-\d+)?", "", cleaned, flags=re.IGNORECASE)
     cleaned = normalize_position_text(cleaned)
     cleaned = re.sub(r"\s+", "", cleaned).strip("、，,;；")
-    if re.search(r"(面向|背向|首排|第二排|[0-9]+[层楼]|顶层|室外|室内)", cleaned):
+    if re.search(rf"(面向|背向|{ROW_POSITION_MARKER_PATTERN}|[0-9]+[层楼]|顶层|室外|室内)", cleaned):
         if not has_orientation_marker(cleaned):
             return extract_floor_position_fragment(cleaned) or cleaned
         return cleaned
@@ -1822,6 +2094,40 @@ def append_background_marker(position: str) -> str:
     if "背景点" in value:
         return value
     return f"{value}背景点"
+
+
+def complete_floor_position_from_plan(text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    compact = re.sub(r"\s+", "", value)
+    blocked_markers = ("距离", "距", "断面", "红线", "中心线")
+    if any(marker in compact for marker in blocked_markers):
+        return ""
+    outdoor = "室外"
+    indoor = "室内"
+    floor = "层"
+    suffix = outdoor if outdoor in compact else indoor if indoor in compact else ""
+    if compact.startswith(outdoor):
+        suffix = outdoor
+    elif compact.startswith(indoor):
+        suffix = indoor
+    numbers: List[str] = []
+    multi_match = re.search(r"((?:\d+[、,，和及])+\d+)层", compact)
+    if multi_match:
+        numbers = re.findall(r"\d+", multi_match.group(1))
+    elif re.fullmatch(r"(?:敏感点)?\d+层(?:室外|室内)?(?:监测)?", compact):
+        numbers = re.findall(r"\d+", compact)
+    elif re.fullmatch(r"(?:室外|室内)?\d+层(?:监测)?", compact):
+        numbers = re.findall(r"\d+", compact)
+    if numbers:
+        floors = [f"{number}{floor}" for number in numbers]
+        if suffix:
+            floors[-1] = f"{floors[-1]}{suffix}"
+        return "、".join(floors)
+    if "顶层" in compact:
+        return f"顶层{suffix}" if suffix and suffix not in compact else "顶层"
+    return ""
 
 
 def first_floor_position_from_plan(text: str) -> str:
@@ -1887,7 +2193,7 @@ def record_indoor_outdoor_marker(record: Dict[str, Any], plan: Optional[Dict[str
 
 
 def apply_indoor_outdoor_marker(position: Any, marker: str) -> str:
-    text = str(position or "").strip()
+    text = normalize_floor_position_display(position)
     if not text or text == "-":
         return text or "-"
     marker = str(marker or "").strip()
@@ -1907,7 +2213,7 @@ def apply_indoor_outdoor_marker(position: Any, marker: str) -> str:
 
 
 def has_orientation_marker(text: str) -> bool:
-    return bool(re.search(r"(面向|背向|首排|第二排|本项目|道路|铁路|陇海线)", str(text or "")))
+    return bool(re.search(rf"(面向|背向|{ROW_POSITION_MARKER_PATTERN}|本项目|道路|铁路|陇海线)", str(text or "")))
 
 
 def enrich_floor_position_with_plan_context(position: str, plan: Dict[str, Any]) -> str:
@@ -1988,7 +2294,7 @@ def base_result_row(plan: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "监测点编号": plan.get("point_code") or "-",
         "监测点名称": plan.get("point_name") or "-",
-        "监测点位置": plan.get("position") or "-",
+        "监测点位置": normalize_floor_position_display(plan.get("position") or "-"),
     }
 
 
@@ -2168,7 +2474,7 @@ def build_noise_monitoring_meta(
     plan_rows: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     report_path = find_report_path()
-    chunks = load_docx_chunks(report_path)
+    chunks = load_docx_chunks(report_path) if report_path else []
     monitoring_unit = extract_monitoring_unit(chunks)
     report_ranges = extract_report_noise_date_ranges(chunks)
     record_dates = collect_monitor_dates_from_records(records)
@@ -2183,14 +2489,17 @@ def build_noise_monitoring_meta(
         "monitor_date_text": format_date_ranges_text(merged_ranges),
         "monitor_dates": [format_date_cn(*item) for item in record_dates],
         "road_hint": infer_road_hint(plan_rows),
-        "source_file": str(report_path),
+        "source_file": str(report_path or next(INPUT_DIR.glob("*.xlsx"), "")),
     }
 
 
-def find_report_path() -> Path:
+def find_report_path() -> Optional[Path]:
     return next(
-        path for path in INPUT_DIR.glob("*.docx")
-        if "报告" in path.name and not path.name.startswith("~$")
+        (
+            path for path in INPUT_DIR.glob("*.docx")
+            if "报告" in path.name and not path.name.startswith("~$")
+        ),
+        None,
     )
 
 
@@ -2652,7 +2961,6 @@ def build_docx(
             merge_name_only=True,
         )
         add_body_paragraph(doc, texts["attenuation_conclusion"])
-    add_portrait_section(doc)
     return doc
 
 
@@ -2677,6 +2985,25 @@ def format_exceed_items(items: List[Dict[str, Any]]) -> str:
     )
 
 
+def configure_result_table_geometry(table: Any, vehicle_breakdown: bool) -> None:
+    if not vehicle_breakdown:
+        return
+    table.autofit = False
+    widths_cm = [1.2, 2.5, 2.8] + [0.78] * 10 + [0.86] * 12
+    for column, width_cm in zip(table.columns, widths_cm):
+        column.width = Cm(width_cm)
+
+
+def compact_vehicle_table_text(table: Any, vehicle_breakdown: bool) -> None:
+    if not vehicle_breakdown:
+        return
+    for row in table.rows:
+        for cell in row.cells:
+            for paragraph in cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.size = Pt(8)
+
+
 def add_result_table(
     doc: Document,
     rows: List[Dict[str, Any]],
@@ -2685,17 +3012,24 @@ def add_result_table(
     merge_name_only: bool = False,
 ) -> None:
     include_flow = include_flow and has_traffic_flow(rows)
-    headers = result_headers(include_flow=include_flow)
-    table = doc.add_table(rows=3, cols=len(headers))
+    vehicle_breakdown = include_flow and has_vehicle_flow_breakdown(rows)
+    header_row_count = 4 if vehicle_breakdown else 3
+    headers = result_headers(include_flow=include_flow, vehicle_breakdown=vehicle_breakdown)
+    table = doc.add_table(rows=header_row_count, cols=len(headers))
     table.style = TABLE_STYLE
-    build_result_table_header(table, include_flow=include_flow, flow_label=flow_label or flow_label_from_rows(rows))
+    configure_result_table_geometry(table, vehicle_breakdown)
+    if vehicle_breakdown:
+        build_road_vehicle_result_table_header(table, flow_label or flow_label_from_rows(rows))
+    else:
+        build_result_table_header(table, include_flow=include_flow, flow_label=flow_label or flow_label_from_rows(rows))
     for row in rows:
         cells = table.add_row().cells
         for i, header in enumerate(headers):
             value = row.get(header, "-")
             cells[i].text = "-" if value == 0 and header.startswith("exceed_") else str(value)
-    merge_blocks = merge_result_identity_cells(table, headers, rows, merge_name_only=merge_name_only)
-    finalize_table(table, header_row_count=3)
+    merge_blocks = merge_result_identity_cells(table, headers, rows, merge_name_only=merge_name_only, header_row_count=header_row_count)
+    finalize_table(table, header_row_count=header_row_count)
+    compact_vehicle_table_text(table, vehicle_breakdown)
     for column_index, start_row, end_row in merge_blocks:
         suppress_vertical_merge_inner_borders(table, column_index, start_row, end_row)
     doc.add_paragraph()
@@ -2706,6 +3040,7 @@ def merge_result_identity_cells(
     headers: List[str],
     rows: List[Dict[str, Any]],
     merge_name_only: bool = False,
+    header_row_count: int = 3,
 ) -> List[Tuple[int, int, int]]:
     if len(rows) <= 1:
         return []
@@ -2715,7 +3050,7 @@ def merge_result_identity_cells(
         return []
     code_col = headers.index(code_header)
     name_col = headers.index(name_header)
-    data_start = 3
+    data_start = header_row_count
     merge_blocks: List[Tuple[int, int, int]] = []
     start = 0
     while start < len(rows):
@@ -2854,8 +3189,55 @@ def merge_repeated_data_columns(
     return merge_blocks
 
 
-def build_result_table_header(table: Any, include_flow: bool = True, flow_label: str = "车流量（辆/20min）") -> None:
-    # Left fixed columns: vertical merge across the three header rows.
+def build_road_vehicle_result_table_header(table: Any, flow_label: str) -> None:
+    final_header_row = 3
+    fixed_labels = (
+        (0, "\u76d1\u6d4b\u70b9\u7f16\u53f7"),
+        (1, "\u76d1\u6d4b\u70b9\u540d\u79f0"),
+        (2, "\u76d1\u6d4b\u70b9\u4f4d\u7f6e"),
+    )
+    for column, label in fixed_labels:
+        table.cell(0, column).merge(table.cell(final_header_row, column)).text = label
+
+    table.cell(0, 3).merge(table.cell(0, 6)).text = "LAeq"
+    table.cell(0, 7).merge(table.cell(1, 8)).text = "\u5e73\u5747\u503c"
+    table.cell(0, 9).merge(table.cell(1, 10)).text = "\u6807\u51c6\u503c"
+    table.cell(0, 11).merge(table.cell(1, 12)).text = "\u8d85\u6807\u91cf"
+
+    table.cell(1, 3).merge(table.cell(1, 4)).text = "\u7b2c\u4e00\u5929"
+    table.cell(1, 5).merge(table.cell(1, 6)).text = "\u7b2c\u4e8c\u5929"
+
+    day_night_labels = {
+        3: "\u663c",
+        4: "\u591c",
+        5: "\u663c",
+        6: "\u591c",
+        7: "\u663c",
+        8: "\u591c",
+        9: "\u663c",
+        10: "\u591c",
+        11: "\u663c",
+        12: "\u591c",
+    }
+    for column, label in day_night_labels.items():
+        table.cell(2, column).merge(table.cell(3, column)).text = label
+
+    table.cell(0, 13).merge(table.cell(0, 24)).text = flow_label or "\u8f66\u6d41\u91cf\uff08\u8f86/20min\uff09"
+    table.cell(1, 13).merge(table.cell(1, 18)).text = "\u7b2c\u4e00\u5929"
+    table.cell(1, 19).merge(table.cell(1, 24)).text = "\u7b2c\u4e8c\u5929"
+    for start_column, label in ((13, "\u663c"), (16, "\u591c"), (19, "\u663c"), (22, "\u591c")):
+        table.cell(2, start_column).merge(table.cell(2, start_column + 2)).text = label
+        for offset, vehicle in enumerate(ROAD_VEHICLE_KEYS):
+            table.cell(3, start_column + offset).text = ROAD_VEHICLE_LABELS[vehicle]
+
+    for row in table.rows[:4]:
+        for cell in row.cells:
+            if HEADER_FILL:
+                shade_cell(cell, HEADER_FILL)
+
+
+def build_result_table_header(table: Any, include_flow: bool = True, flow_label: str = "\u8f66\u6d41\u91cf\uff08\u8f86/20min\uff09") -> None:
+
     for col, text in [(0, "监测点编号"), (1, "监测点名称"), (2, "监测点位置")]:
         cell = table.cell(0, col).merge(table.cell(2, col))
         cell.text = text
@@ -2922,7 +3304,7 @@ def row_to_dict(headers: List[str], row: List[str]) -> Dict[str, Any]:
 
 
 def extract_point_code(text: str) -> Optional[str]:
-    match = re.search(r"(?<![A-Za-z0-9])N(?:J)?\d+(?:-\d+)?(?![A-Za-z0-9-])", text or "", flags=re.IGNORECASE)
+    match = re.search(r"(?<![A-Za-z0-9])N(?:J)?\d+(?:-\d+){0,2}(?![A-Za-z0-9-])", text or "", flags=re.IGNORECASE)
     if not match:
         return None
     code = match.group(0).upper()
@@ -2932,7 +3314,7 @@ def extract_point_code(text: str) -> Optional[str]:
 
 
 def is_valid_noise_point_code(code: Any) -> bool:
-    return bool(re.fullmatch(r"NJ\d+(?:-\d+)?", str(code or "").strip(), flags=re.IGNORECASE))
+    return bool(re.fullmatch(r"NJ\d+(?:-\d+){0,2}", str(code or "").strip(), flags=re.IGNORECASE))
 
 
 def extract_distance(text: str) -> Optional[str]:
@@ -2973,6 +3355,33 @@ def exceed_text(avg: Optional[int], limit: Optional[int]) -> Any:
     return max(0, avg - limit)
 
 
+def vehicle_flow_text(
+    pairs: List[Dict[str, Dict[str, Any]]],
+    day_index: int,
+    period: str,
+    vehicle: str,
+) -> str:
+    if day_index >= len(pairs):
+        return "/"
+    record = pairs[day_index].get(period)
+    if not record:
+        return "/"
+    value = str(record.get(f"traffic_flow_{vehicle}") or "").strip()
+    if value not in {"", "-", "/", "\u2014"}:
+        return value
+    breakdown = parse_road_flow_breakdown(record.get("traffic_flow"))
+    return str(breakdown.get(vehicle) or "/")
+
+
+def add_vehicle_flow_fields(row: Dict[str, Any], pairs: List[Dict[str, Dict[str, Any]]]) -> None:
+    for day_number, day_index in ((1, 0), (2, 1)):
+        for period in ("day", "night"):
+            base = f"traffic_flow_day{day_number}_{period}"
+            for vehicle in ROAD_VEHICLE_KEYS:
+                row[f"{base}_{vehicle}"] = vehicle_flow_text(
+                    pairs, day_index, period, vehicle
+                )
+
 def flow_text(pairs: List[Dict[str, Dict[str, Any]]], day_index: int, period: str) -> str:
     if day_index >= len(pairs):
         return "/"
@@ -2982,12 +3391,12 @@ def flow_text(pairs: List[Dict[str, Dict[str, Any]]], day_index: int, period: st
     return str(record.get("traffic_flow") or "/").replace(" ", "/")
 
 
-def point_sort_key(code: Any) -> Tuple[int, int, str]:
+def point_sort_key(code: Any) -> Tuple[int, int, int, str]:
     text = str(code or "")
-    match = re.search(r"N(?:J)?(\d+)(?:-(\d+))?", text, flags=re.IGNORECASE)
+    match = re.search(r"N(?:J)?(\d+)(?:-(\d+))?(?:-(\d+))?", text, flags=re.IGNORECASE)
     if not match:
-        return (9999, 9999, text)
-    return (int(match.group(1)), int(match.group(2) or 0), text)
+        return (9999, 9999, 9999, text)
+    return (int(match.group(1)), int(match.group(2) or 0), int(match.group(3) or 0), text)
 
 
 def write_json(path: Path, payload: Any) -> None:

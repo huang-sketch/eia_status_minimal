@@ -15,6 +15,7 @@ function formatValue(value) {
 
 function statusLabel(value) {
   return {
+    queued: "排队中",
     pending: "等待中",
     running: "运行中",
     success: "成功",
@@ -150,7 +151,7 @@ function renderTextDownloads(groups, jobId) {
       const link = document.createElement("a");
       link.className = "download-button";
       link.href = `/api/jobs/${jobId}/download/${encodeURI(file.path)}`;
-      link.textContent = downloadLabel(file.name);
+      link.textContent = file.label || downloadLabel(file.name);
       link.target = "_blank";
       container.appendChild(link);
     });
@@ -215,6 +216,34 @@ function renderSchemaReviewBanner(reasons, state) {
   }
   list.innerHTML = reasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join("");
   banner.style.display = "";
+}
+
+function renderInputValidationStatus(validation, jobId) {
+  const banner = document.getElementById("inputValidationBanner");
+  const list = document.getElementById("inputValidationReasons");
+  const downloads = document.getElementById("inputValidationDownloads");
+  if (!banner || !list || !downloads) return;
+  const errors = Array.isArray(validation.errors) ? validation.errors.filter(Boolean) : [];
+  if (validation.state !== "failed" || !errors.length) {
+    banner.style.display = "none";
+    list.innerHTML = "";
+    downloads.innerHTML = "";
+    return;
+  }
+  banner.style.display = "";
+  const visibleErrors = errors.slice(0, 20);
+  if (errors.length > visibleErrors.length) {
+    visibleErrors.push(`另有 ${errors.length - visibleErrors.length} 项，详见下载的校核结果`);
+  }
+  const files = [
+    [validation.report_path, "下载输入校核结果"],
+    [validation.correspondence_path, "下载点位对应清单"]
+  ].filter(([path]) => path);
+  downloads.innerHTML = files.map(([path, label]) => `
+    <a class="download-button secondary"
+      href="/api/jobs/${encodeURIComponent(jobId)}/download/${encodeURI(path)}"
+      target="_blank">${escapeHtml(label)}</a>
+  `).join("");
 }
 
 function bindTabButtons() {

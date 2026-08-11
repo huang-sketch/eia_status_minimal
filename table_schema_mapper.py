@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from eia_document_router import diagnose_rule_failure_with_llm
 from llm_client import LlmProfile, chat_completion_json_object
 
 
@@ -14,7 +15,9 @@ DEFAULT_CONFIG_PATH = BASE_DIR / "config" / "table_schema_mappings.json"
 DEBUG_FILENAMES = {
     "detection": "table_schema_detection.json",
     "llm_input": "table_schema_llm_input.json",
+    "candidates": "table_schema_candidates.json",
     "llm_output": "table_schema_llm_output.json",
+    "router_diagnosis": "eia_router_diagnostics.json",
     "validation": "table_schema_validation.json",
 }
 
@@ -109,7 +112,39 @@ def resolve_table_schema(
         "llm_error": llm_error,
     }
     if valid:
-        promote_llm_candidates(config, schema_name, mapping, sources, job_id, source_table)
+        record_llm_candidates(
+            output_dir,
+            schema_name,
+            mapping,
+            sources,
+            job_id,
+            source_table,
+            header_list,
+        )
+    else:
+        diagnosis = diagnose_rule_failure_with_llm(
+            {
+                "schema": schema_name,
+                "candidate_rule": schema_name,
+                "missing_fields": missing_after_llm,
+                "headers": header_list,
+                "sample_rows": sample_rows or [],
+                "table_title": table_title,
+                "context": context,
+                "source_table": source_table,
+                "llm_status": llm_status,
+                "llm_error": llm_error,
+            }
+        )
+        write_debug_event(
+            output_dir,
+            "router_diagnosis",
+            {
+                "schema": schema_name,
+                "source_table": source_table,
+                "diagnosis": diagnosis,
+            },
+        )
 
     result = {
         "schema": schema_name,
@@ -233,57 +268,33 @@ def validate_llm_mapping(
     return accepted
 
 
-def promote_llm_candidates(
-    config: Dict[str, Any],
+def record_llm_candidates(
+    output_dir: Optional[Path],
     schema_name: str,
     mapping: Dict[str, str],
     sources: Dict[str, str],
     job_id: str,
     source_table: str,
+    source_headers: List[str],
 ) -> None:
-    changed = False
-    candidates = config.setdefault("candidates", [])
-    schemas = config.setdefault("schemas", {})
-    aliases = schemas.setdefault(schema_name, {}).setdefault("aliases", {})
+    if output_dir is None:
+        return
     for field, header in mapping.items():
-        if sources.get(field) not in {"llm", "candidate"}:
+        if sources.get(field) != "llm" or header not in source_headers:
             continue
-        if header in aliases.setdefault(field, []):
-            continue
-        candidate = next(
-            (
-                item
-                for item in candidates
-                if item.get("schema") == schema_name
-                and item.get("field") == field
-                and item.get("header") == header
-            ),
-            None,
-        )
-        if candidate is None:
-            candidate = {
+        write_debug_event(
+            output_dir,
+            "candidates",
+            {
                 "schema": schema_name,
                 "field": field,
                 "header": header,
-                "validated_jobs": [],
-                "first_seen_at": datetime.now().isoformat(timespec="seconds"),
-                "first_source_table": source_table,
-            }
-            candidates.append(candidate)
-            changed = True
-        validated_jobs = candidate.setdefault("validated_jobs", [])
-        identity = job_id or source_table or "unknown"
-        if identity not in validated_jobs:
-            validated_jobs.append(identity)
-            changed = True
-        if len(validated_jobs) >= 2:
-            aliases[field].append(header)
-            candidates.remove(candidate)
-            changed = True
-    if changed:
-        DEFAULT_CONFIG_PATH.write_text(
-            json.dumps(config, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+                "source_headers": source_headers,
+                "source_table": source_table,
+                "job_id": job_id,
+                "validation_status": "accepted",
+                "seen_at": datetime.now().isoformat(timespec="seconds"),
+            },
         )
 
 
@@ -311,6 +322,22 @@ def write_debug_event(output_dir: Optional[Path], kind: str, payload: Dict[str, 
                 isinstance(item, dict)
                 and item.get("schema") == schema
                 and item.get("source_table") == source_table
+            )
+        ]
+    if kind == "candidates":
+        identity = (
+            payload.get("schema"),
+            payload.get("field"),
+            payload.get("header"),
+            payload.get("source_table"),
+        )
+        items = [
+            item
+            for item in items
+            if not (
+                isinstance(item, dict)
+                and (item.get("schema"), item.get("field"), item.get("header"), item.get("source_table"))
+                == identity
             )
         ]
     items.append(payload)
