@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "standard_name": "GB 3096-2008",
+  "limits": {
+    "0类": { "day": 50, "night": 40 },
+    "1类": { "day": 55, "night": 45 },
+    "2类": { "day": 60, "night": 50 },
+    "3类": { "day": 65, "night": 55 },
+    "4a类": { "day": 70, "night": 55 },
+    "4b类": { "day": 70, "night": 60 }
+  },
+  "display_precision": 2
+}

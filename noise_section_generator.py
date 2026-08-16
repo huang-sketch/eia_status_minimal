@@ -51,6 +51,9 @@ BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = Path(os.getenv("EIA_INPUT_DIR", "input"))
 OUTPUT_DIR = Path(os.getenv("EIA_OUTPUT_DIR", "output"))
 DEBUG_DIR = OUTPUT_DIR / "debug_tables"
+NOISE_STANDARD_LIMITS_PATH = Path(
+    os.getenv("EIA_NOISE_STANDARD_LIMITS", BASE_DIR / "config" / "noise_standard_limits.json")
+)
 OUTPUT_DOCX = OUTPUT_DIR / "noise_section.docx"
 ENABLE_LLM_TEXT_POLISH = os.getenv("ENABLE_LLM_TEXT_POLISH", "false").lower() == "true"
 TEXT_POLISH_GUIDANCE_PATH = Path(
@@ -77,8 +80,7 @@ DATE_RANGE_RE = re.compile(
     r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\s*[-~–—至]\s*(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})"
 )
 
-DAY_LIMITS = {"0类": 50, "1类": 55, "2类": 60, "3类": 65, "4a类": 70, "4b类": 70}
-NIGHT_LIMITS = {"0类": 40, "1类": 45, "2类": 50, "3类": 55, "4a类": 55, "4b类": 60}
+_NOISE_LIMITS_CACHE: Optional[Dict[str, Any]] = None
 
 NOISE_TABLE_MONITOR_POINTS = "noise_monitor_points"
 NOISE_TABLE_SENSITIVE = "noise_sensitive_results"
@@ -348,13 +350,28 @@ def parse_custom_noise_standard_limits(value: Any) -> Tuple[Optional[int], Optio
     return int(match.group(1)), int(match.group(2))
 
 
-def noise_standard_limits(plan: Dict[str, Any]) -> Tuple[Optional[int], Optional[int]]:
+def load_noise_standard_limits() -> Dict[str, Any]:
+    global _NOISE_LIMITS_CACHE
+    if _NOISE_LIMITS_CACHE is not None:
+        return _NOISE_LIMITS_CACHE
+    try:
+        payload = json.loads(NOISE_STANDARD_LIMITS_PATH.read_text(encoding="utf-8"))
+        limits = payload.get("limits") if isinstance(payload, dict) else None
+        if not isinstance(limits, dict):
+            raise ValueError("limits must be an object")
+        _NOISE_LIMITS_CACHE = payload
+    except Exception as exc:
+        _NOISE_LIMITS_CACHE = {"limits": {}, "error": str(exc)}
+    return _NOISE_LIMITS_CACHE
+
+
+def noise_standard_limits(plan: Dict[str, Any]) -> Tuple[Optional[Decimal], Optional[Decimal]]:
     custom_day = plan.get("standard_day")
     custom_night = plan.get("standard_night")
     if custom_day is not None and custom_night is not None:
-        return parse_int(custom_day), parse_int(custom_night)
-    standard_class = plan.get("standard_class")
-    return DAY_LIMITS.get(standard_class), NIGHT_LIMITS.get(standard_class)
+        return parse_decimal(custom_day), parse_decimal(custom_night)
+    item = (load_noise_standard_limits().get("limits") or {}).get(plan.get("standard_class")) or {}
+    return parse_decimal(item.get("day")), parse_decimal(item.get("night"))
 
 
 def noise_standard_display(plan: Dict[str, Any]) -> str:
@@ -2301,14 +2318,14 @@ def base_result_row(plan: Dict[str, Any]) -> Dict[str, Any]:
 def compute_point_metrics(records: List[Dict[str, Any]], plan: Dict[str, Any]) -> Dict[str, Any]:
     pairs = paired_records(records)
     warnings: List[str] = []
-    day_values: List[int] = []
-    night_values: List[int] = []
+    day_values: List[Decimal] = []
+    night_values: List[Decimal] = []
     result: Dict[str, Any] = {}
     for day_index in range(2):
         day_record = pairs[day_index].get("day") if day_index < len(pairs) else None
         night_record = pairs[day_index].get("night") if day_index < len(pairs) else None
-        day_value = parse_int(day_record.get("laeq")) if day_record else None
-        night_value = parse_int(night_record.get("laeq")) if night_record else None
+        day_value = parse_decimal(day_record.get("laeq")) if day_record else None
+        night_value = parse_decimal(night_record.get("laeq")) if night_record else None
         result[f"day{day_index + 1}_day"] = value_or_dash(day_value)
         result[f"day{day_index + 1}_night"] = value_or_dash(night_value)
         if day_value is not None:
@@ -2319,8 +2336,8 @@ def compute_point_metrics(records: List[Dict[str, Any]], plan: Dict[str, Any]) -
             night_values.append(night_value)
         else:
             warnings.append(f"{plan.get('point_code')} 第{day_index + 1}天夜间缺失")
-    avg_day = round_half_up(sum(day_values) / len(day_values)) if day_values else None
-    avg_night = round_half_up(sum(night_values) / len(night_values)) if night_values else None
+    avg_day = quantize_noise_decimal(sum(day_values) / Decimal(len(day_values))) if day_values else None
+    avg_night = quantize_noise_decimal(sum(night_values) / Decimal(len(night_values))) if night_values else None
     standard_day, standard_night = noise_standard_limits(plan)
     if standard_day is None or standard_night is None:
         warnings.append(f"{plan.get('point_code')} 未识别现状标准: {plan.get('standard_class_raw') or plan.get('standard_class')}")
@@ -2365,7 +2382,8 @@ def summarize_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         row_exceeded = False
         for period, field in [("昼间", "exceed_day"), ("夜间", "exceed_night")]:
             value = row.get(field)
-            if isinstance(value, int) and value > 0:
+            numeric_value = parse_decimal(value)
+            if numeric_value is not None and numeric_value > 0:
                 row_exceeded = True
                 exceed_items.append(
                     {
@@ -3334,11 +3352,16 @@ def infer_period(time_text: str) -> str:
     return "day" if 6 <= hour < 22 else "night"
 
 
-def parse_int(value: Any) -> Optional[int]:
+def parse_decimal(value: Any) -> Optional[Decimal]:
     match = re.search(r"\d+(?:\.\d+)?", str(value or ""))
     if not match:
         return None
-    return int(Decimal(match.group(0)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    return Decimal(match.group(0))
+
+
+def parse_int(value: Any) -> Optional[int]:
+    parsed = parse_decimal(value)
+    return int(parsed.quantize(Decimal("1"), rounding=ROUND_HALF_UP)) if parsed is not None else None
 
 
 def round_half_up(value: float) -> int:
@@ -3346,13 +3369,27 @@ def round_half_up(value: float) -> int:
 
 
 def value_or_dash(value: Any) -> Any:
-    return "-" if value is None else value
+    return "-" if value is None else format_decimal(value)
 
 
-def exceed_text(avg: Optional[int], limit: Optional[int]) -> Any:
+def quantize_noise_decimal(value: Decimal) -> Decimal:
+    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def format_decimal(value: Any) -> Any:
+    if value is None:
+        return None
+    decimal_value = value if isinstance(value, Decimal) else Decimal(str(value))
+    text = format(decimal_value, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def exceed_text(avg: Optional[Decimal], limit: Optional[Decimal]) -> Any:
     if avg is None or limit is None:
         return "-"
-    return max(0, avg - limit)
+    rounded_avg = quantize_noise_decimal(avg)
+    rounded_limit = quantize_noise_decimal(limit)
+    return format_decimal(max(Decimal("0"), rounded_avg - rounded_limit))
 
 
 def vehicle_flow_text(

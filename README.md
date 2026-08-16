@@ -1,120 +1,159 @@
-# EIA Status Minimal
+# 高速公路环评现状分析自动化系统
 
-环评现状分析模块的最小版本。当前目标是从 `.docx` 文件中读取段落和表格，按切片提取现状监测记录，并输出 JSON。
+本项目是一个本地运行的 FastAPI 应用，用于从监测方案和监测数据中生成高速公路环评的声环境、地表水现状调查与评价章节。系统以确定性规则完成数据解析、方案与报告对应、标准判断和 Word 表格生成；大模型只用于表头解释、可选正文润色和可选项目区域环境概况。
 
-## 安装依赖
+当前没有 Streamlit 入口。Web 服务入口是 `web_app.py`，默认地址为 `http://127.0.0.1:8010`。
 
-建议在项目目录中创建并启用虚拟环境，然后安装依赖：
+## 当前能力
 
-```powershell
-pip install -r requirements.txt
+### 已接入 Web 主流程
+
+- 声环境监测方案解析、监测结果解析、昼夜平均值和超标量计算。
+- 地表水监测方案解析、监测结果解析、GB 3838-2002 单项标准指数和达标判断。
+- 两种监测数据来源：监测方案 DOCX + 监测报告 DOCX；监测方案 DOCX + 规则化监测数据 XLSX。
+- XLSX 点位一一对应校验、声环境 `NJX-Y-Z`编号校验和输入错误阻断。
+- 本地单进程 FIFO 队列、任务状态持久化、服务重启后的排队任务恢复。
+- 声环境、地表水章节 Word 生成、章节重新编号、合并报告和 ZIP 打包。
+- 最终报告名称使用前端项目名称，格式为 `<项目名称>现状调查与评价.docx`。
+
+### 尚未形成完整业务链
+
+- 环境空气只有通用识别和路由基础，没有专用标准判断、Word 章节或前端入口。
+- 公报功能只有本地静态缓存和简单网页检索，没有公报文件归档、PDF 解析、数据库或来源版本管理。
+- 当前没有知识库、向量库或 RAG。
+- 内置任务队列只支持本地单机、单 Uvicorn worker，不适用于多 worker 或分布式部署。
+
+## 处理流程
+
+```text
+前端项目信息和上传文件
+  -> DOCX 分块或 XLSX 输入校验
+  -> 方案表头与点位解析
+  -> 监测值、日期、单位和车流量解析
+  -> 确定性标准判断
+  -> JSON 中间数据和校验数据
+  -> 可选 LLM 正文润色
+  -> 声环境/地表水 Word 章节
+  -> 章节重新编号和合并
+  -> <项目名称>现状调查与评价.docx + eia_outputs.zip
 ```
 
-## 输入文件
+方案是点位名称、位置、标准类别和监测要求的主要依据；监测报告或 XLSX 是监测日期、实测值、单位和车流量的主要依据。LLM 不计算标准指数，也不决定最终达标结论。
 
-将需要分析的 Word 文件放到项目目录，或在运行命令中传入文件的完整路径。
-
-当前仅支持 `.docx` 文件。
-
-## 运行
-
-使用本地 mock 流程运行：
+## 安装
 
 ```powershell
-python main.py input.docx -o eia_result.json
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
 ```
 
-也可以一次传入多个文件：
-
-```powershell
-python main.py report.docx plan.docx -o eia_result.json
-```
-
-输出文件默认为 `eia_result.json`，内容包括：
-
-- `records`: 提取到的监测记录
-- `meta`: 输入文件、切片数量、记录数量
-
-## LLM 环境变量
-
-LLM 调用已统一到 [llm_client.py](llm_client.py)。未配置 `EIA_LLM_API_KEY` 时，规则路径仍可运行；需要 LLM 的功能会回退或跳过。
-
-配置 API key 后，程序会调用 OpenAI 兼容的 chat completions 接口：
-
-```powershell
-$env:EIA_LLM_API_KEY="your-api-key"
-$env:EIA_LLM_ENDPOINT="https://api.openai.com/v1/chat/completions"
-$env:EIA_LLM_MODEL="gpt-4o-mini"
-python main.py input.docx -o eia_result.json
-```
-
-### 公共变量
-
-| 变量 | 说明 |
-|------|------|
-| `EIA_LLM_API_KEY` | LLM API key |
-| `EIA_LLM_ENDPOINT` | OpenAI 兼容接口地址，默认 `https://api.openai.com/v1/chat/completions` |
-| `EIA_LLM_TIMEOUT_SECONDS` | 单次请求超时（秒），默认 `25` |
-| `EIA_LLM_MAX_RETRIES` | 失败重试次数，默认 `1` |
-| `EIA_LLM_DISABLE` | 设为 `1` 可禁用 LLM（CLI 抽取路径） |
-
-### 场景 Profile 默认值
-
-| Profile | 用途 | 默认 model | temperature | max_tokens 环境变量 |
-|---------|------|------------|-------------|---------------------|
-| `extraction` | CLI 监测数据抽取（`main.py`） | `gpt-4o-mini` | 0 | `EIA_LLM_MAX_TOKENS`（默认 2048） |
-| `text_polish` | 地表水/声环境 Word 文本润色 | `qwen-plus` | 0.2 | `EIA_LLM_TEXT_MAX_TOKENS`（默认 1800） |
-| `project_overview` | 项目区域环境概况 | `qwen-plus` | 0.2 | `EIA_PROJECT_OVERVIEW_MAX_TOKENS`（默认 3500） |
-| `fast` | 复杂噪声表分片抽取 | `qwen-flash` | 0 | `EIA_LLM_FAST_MAX_TOKENS`（默认 4096） |
-
-各 Profile 的 model 仍可通过 `EIA_LLM_MODEL` 或 `EIA_LLM_FAST_MODEL` 覆盖。
-
-### Web 服务
+## 启动 Web 服务
 
 ```powershell
 python web_app.py
 ```
 
-默认监听 `http://127.0.0.1:8010`，可通过 `EIA_WEB_PORT` 修改端口。
+默认监听 `http://127.0.0.1:8010`。Web 表单需要填写项目名称和行政区划，选择声环境、地表水生成模块，并选择一种输入模式：
 
-地表水任务流程：
+| 输入模式 | 监测方案 | 监测数据 |
+|---|---|---|
+| Word 监测报告 | `.docx` | `.docx` |
+| XLSX 监测数据 | `.docx` | `.xlsx` |
 
-1. `monitoring_extraction.py` — CLI 抽取（方案 + 报告），输出到 `output/extraction/`
-2. `surface_water_pipeline.py` — CLI 记录为主、规则解析 fallback，写入 `monitoring_records.json`
-3. `surface_water_section_generator.py` — 生成 Word 章节
+单个上传文件默认最大 30 MB。至少选择声环境或地表水中的一个模块。
 
-Web 表单选项：
+## 独立 CLI
 
-- **启用 LLM 表格抽取**：对应 `ENABLE_LLM_EXTRACTION=true`，需配置 `EIA_LLM_API_KEY`；未勾选时仍运行 CLI 抽取，但仅使用规则 fallback
-- **启用 LLM 文本润色**：对应 `ENABLE_LLM_TEXT_POLISH=true`
+通用 DOCX 抽取入口仍可独立运行：
 
-Web 抽取相关环境变量：
+```powershell
+python main.py report.docx plan.docx -o output/eia_result_test.json
+```
 
-| 变量 | 说明 |
-|------|------|
-| `ENABLE_LLM_EXTRACTION` | Web 表单「启用 LLM 表格抽取」 |
-| `EIA_MAX_CHUNKS_PER_RUN` | Web 任务默认可处理 chunk 数，默认 `100`（CLI `main.py` 默认 `20`） |
-| `EIA_OUTPUT_DIR/extraction/` | 存放 `eia_result.json`、`records.json`、`meta.json` |
-| `EIA_OUTPUT_DIR/debug_tables/extraction_summary.json` | CLI/规则合并统计 |
+该入口输出通用抽取记录和元数据，不等同于完整 Web 章节生成流程。Web 的 DOCX 地表水链会通过 `monitoring_extraction.py`调用通用抽取器，但会强制使用规则抽取；表头 LLM 兜底由后续专用映射器处理。
 
-## Development and stabilization
+## LLM 职责
 
-Install the test dependencies and run the deterministic regression suite:
+LLM 调用统一由 `llm_client.py`管理，使用 OpenAI 兼容的 Chat Completions 接口。
 
-    python -m pip install -r requirements-dev.txt
-    python -m pytest
+| 能力 | 默认状态 | 失败行为 |
+|---|---|---|
+| 表头结构兜底 | Web 默认勾选 | 无 API key 或调用失败时继续使用正式规则；无法满足必需字段时标记人工复核 |
+| 声环境/地表水正文润色 | 默认关闭 | 回退到确定性规则文本，不改变监测值和结论 |
+| 项目区域环境概况 | 有 API key 时尝试 | 作为可选步骤跳过，不阻断声环境和地表水报告 |
+| 表格影子分类 | 默认关闭 | 仅生成诊断数据，不参与正式结果 |
 
-The built-in Web job queue supports exactly one server worker. Queued jobs are
-recovered after a restart; a job that was already running is marked failed so
-that partially generated output is never resumed as if it were complete.
+LLM 表头映射只允许引用输入中真实存在的表头。运行时接受的新映射写入任务目录下的 `debug_tables/table_schema_candidates.json`，不会自动修改正式配置。
 
-LLM-assisted schema mappings are written to the per-job
-debug_tables/table_schema_candidates.json file for review.
+```powershell
+# 只审核，不修改正式配置
+python scripts/promote_schema_candidates.py --input <candidate-json>
 
-Review candidates without changing the repository configuration:
+# 显式应用无冲突候选
+python scripts/promote_schema_candidates.py --input <candidate-json> --apply
+```
 
-    python scripts/promote_schema_candidates.py --input <candidate-json>
+## 主要环境变量
 
-After review, apply a conflict-free candidate set explicitly:
+| 变量 | 默认值 | 说明 |
+|---|---:|---|
+| `EIA_WEB_PORT` | `8010` | Web 服务端口 |
+| `EIA_WEB_RELOAD` | `false` | 是否启用 Uvicorn reload |
+| `EIA_MAX_UPLOAD_MB` | `30` | 单个上传文件大小限制 |
+| `EIA_JOB_RETENTION_COUNT` | `30` | 最多保留的已结束任务数 |
+| `EIA_JOB_RETENTION_DAYS` | `7` | 已结束任务保留天数 |
+| `EIA_QUEUE_POLL_SECONDS` | `2` | 队列轮询间隔 |
+| `WEB_CONCURRENCY` / `UVICORN_WORKERS` | `1` | 必须为 1，否则服务启动失败 |
+| `EIA_LLM_API_KEY` | 无 | LLM API key；未配置时规则主流程仍可运行 |
+| `EIA_LLM_ENDPOINT` | `https://api.openai.com/v1/chat/completions` | OpenAI 兼容接口地址 |
+| `EIA_LLM_MODEL` | 按 profile 选择 | 文本润色、概况或抽取模型 |
+| `EIA_LLM_FAST_MODEL` | `qwen-flash` | 表头映射和快速分类模型 |
+| `EIA_LLM_TIMEOUT_SECONDS` | `25` | 普通 LLM 请求超时秒数 |
+| `EIA_LLM_TEXT_TIMEOUT_SECONDS` | `120` | 文本类 LLM 请求超时秒数 |
+| `EIA_SURFACE_WATER_WEB_SEARCH` | `true` | 缓存未命中时是否检索地表水公报网页 |
+| `EIA_SURFACE_WATER_WEB_TIMEOUT_SECONDS` | `12` | 公报网页请求超时秒数 |
+| `ENABLE_LLM_TABLE_CLASSIFICATION_SHADOW` | `false` | 是否运行表格影子分类诊断 |
 
-    python scripts/promote_schema_candidates.py --input <candidate-json> --apply
+Web 会为子进程设置 `EIA_INPUT_DIR`、`EIA_OUTPUT_DIR`、`EIA_DATA_SOURCE_TYPE`、`EIA_RUN_NOISE`、`EIA_RUN_SURFACE_WATER`、`ENABLE_SCHEMA_FALLBACK`和 `ENABLE_LLM_TEXT_POLISH`，通常不需要手工配置。
+
+## 目录与输出
+
+```text
+config/                  正式表头别名、Word 布局、润色规则和公报静态缓存
+static/                  Web 前端
+tests/                   脱敏回归测试
+runs/web_jobs/<job_id>/  Web 任务输入、状态、日志和输出
+scripts/                 人工治理命令
+```
+
+单个 Web 任务的主要输出：
+
+```text
+output/
+  standard_config.json
+  monitoring_records.json
+  compliance_results.json
+  debug_tables/
+  project_area_overview.docx        # 可选
+  noise_section.docx                # 选择声环境时
+  surface_water_section.docx        # 选择地表水且存在数据时
+  <项目名称>现状调查与评价.docx
+  eia_outputs.zip
+```
+
+`input/`、`output/`和 `runs/`默认被 Git 忽略，不应提交真实任务输入和运行结果。详细字段、稳定级别和上下游关系见 [数据契约](docs/data-contracts.md)。
+
+## 测试
+
+```powershell
+python -m pytest -q
+```
+
+测试覆盖 Word 分块、表头映射、地表水指数、声环境楼层/频次/车流量、XLSX 对应关系、任务队列、原子状态写入和脱敏离线生成流程。
+
+## 兼容性原则
+
+- 稳定业务字段只进行向后兼容扩展。
+- 删除、改名或改变稳定字段语义时，必须同步更新数据契约和回归测试。
+- `debug_tables`中的诊断文件默认不是长期稳定 API；前端正在读取的文件除外，具体分级见数据契约。
+- 代码行为与文档冲突时，以经过测试的当前代码为事实来源，并及时修正文档。
