@@ -24,7 +24,9 @@
       "example": "根据项目所在区域的水文特征、河流水体规模，共计在评价范围设置了5个监测断面进行水质监测。监测断面概况详见表4.2-4。",
       "length_chars": "45-75",
       "sentences": "1-2",
-      "must_keep": ["监测断面概况详见表4.2-4"],
+      "must_keep": [
+        "监测断面概况详见表4.2-4"
+      ],
       "notes": "断面数量、河流名称须与本次 rule_texts 一致。"
     },
     "monitoring_time_method_text": {
@@ -32,15 +34,19 @@
       "example": "华设设计集团环境科技有限公司于2025年5月14日~2025年5月16日对沿线的地表水监测断面进行连续三天、每天一次的现状监测。断面垂线和采样点的布设按照国家环保总局颁布的《环境监测技术规范（水和废水部分）》中的规定进行。",
       "length_chars": "90-130",
       "sentences": "2-3",
-      "must_keep": [],
-      "notes": "监测单位、日期、频次须来自 rule_texts；检测方法可概括表述。"
+      "must_keep": [
+        "断面垂线和采样点的布设按照国家环保总局颁布的《环境监测技术规范（水和废水部分）》中的规定进行。"
+      ],
+      "notes": "按监测单位、日期和频次 → 固定布设依据 → 监测因子组织；完整保留 rule_texts 中该段，不照搬示例日期和单位。布设依据不代表实验室检测方法。"
     },
     "monitoring_result_text": {
       "role": "现状监测结果引述",
       "example": "华设设计集团环境科技有限公司于2025年5月14日~2025年5月16日对项目沿线的地表水监测断面进行了现状监测。本项目地表水监测结果详见表4.2-5。",
       "length_chars": "35-120",
       "sentences": "1-3",
-      "must_keep": ["表4.2-5"],
+      "must_keep": [
+        "表4.2-5"
+      ],
       "notes": "开头优先说明监测单位和监测日期；不重复堆砌表格数值。"
     },
     "evaluation_result_intro": {
@@ -48,7 +54,9 @@
       "example": "地表水监测点位环境现状评价结果见表4.2-6。",
       "length_chars": "18-35",
       "sentences": "1",
-      "must_keep": ["表4.2-6"],
+      "must_keep": [
+        "表4.2-6"
+      ],
       "notes": "保持简短，不展开结论。"
     },
     "conclusion": {
@@ -61,12 +69,36 @@
     }
   },
   "length_targets": {
-    "local_status_text": { "min_chars": 80, "max_chars": 280, "paragraphs": 1 },
-    "monitor_points_text": { "min_chars": 40, "max_chars": 90, "paragraphs": 1 },
-    "monitoring_time_method_text": { "min_chars": 80, "max_chars": 150, "paragraphs": 1 },
-    "monitoring_result_text": { "min_chars": 30, "max_chars": 130, "paragraphs": 1 },
-    "evaluation_result_intro": { "min_chars": 15, "max_chars": 40, "paragraphs": 1 },
-    "conclusion": { "min_chars": 50, "max_chars": 200, "paragraphs": 1 }
+    "local_status_text": {
+      "min_chars": 80,
+      "max_chars": 280,
+      "paragraphs": 1
+    },
+    "monitor_points_text": {
+      "min_chars": 40,
+      "max_chars": 90,
+      "paragraphs": 1
+    },
+    "monitoring_time_method_text": {
+      "min_chars": 80,
+      "max_chars": 150,
+      "paragraphs": 1
+    },
+    "monitoring_result_text": {
+      "min_chars": 30,
+      "max_chars": 130,
+      "paragraphs": 1
+    },
+    "evaluation_result_intro": {
+      "min_chars": 15,
+      "max_chars": 40,
+      "paragraphs": 1
+    },
+    "conclusion": {
+      "min_chars": 50,
+      "max_chars": 200,
+      "paragraphs": 1
+    }
   },
   "section_points": {
     "local_status_text": [
@@ -82,9 +114,9 @@
       "句式与长度参考 style_exemplars.monitor_points_text；断面数量、河流名称、断面编号必须服从本次输入。"
     ],
     "monitoring_time_method_text": [
-      "说明监测时间、取样频次和监测因子。",
-      "监测因子必须使用 rule_texts 中列出的因子，不得新增或删除。",
-      "句式与长度参考 style_exemplars.monitoring_time_method_text。"
+      "按监测单位、日期和频次、固定布设依据、监测因子的顺序表达；缺失信息不得编造。",
+      "固定句必须逐字保留且仅出现一次：断面垂线和采样点的布设按照国家环保总局颁布的《环境监测技术规范（水和废水部分）》中的规定进行。",
+      "监测因子使用 rule_texts 中的因子，不得新增或删除。"
     ],
     "monitoring_result_text": [
       "段落开头优先说明监测单位和具体监测日期，句式参考 style_exemplars.monitoring_result_text.example。",

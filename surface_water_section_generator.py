@@ -43,6 +43,7 @@ from formal_text_skill import build_surface_water_formal_text_validation, write_
 from llm_client import LlmProfile, SSL_CONTEXT, build_rule_text_fallback_validation, chat_completion_json_object_with_recovery
 from table_schema_mapper import record_data_validation
 from text_polish_utils import build_text_polish_prompt, load_text_polish_guidance
+from water_writing_rules import build_description, read_source_context
 
 load_dotenv()
 
@@ -136,6 +137,8 @@ def main() -> None:
     local_status = build_local_water_status(project_meta.get("admin_division", ""))
     conclusion = build_conclusion(surface_results)
     rule_texts = build_rule_texts(table1, table2, factor_list, surface_results, conclusion, numbering)
+    source_context = read_source_context(INPUT_DIR)
+    rule_texts["monitoring_time_method_text"] = build_description(table1, factor_list, table2, source_context)
     rule_texts["local_status_text"] = local_status.get("text", "")
     write_json(DEBUG_DIR / "surface_water_local_status.json", local_status)
     texts = polish_surface_water_text_with_llm(
@@ -156,6 +159,17 @@ def main() -> None:
         surface_results,
         texts,
     )
+    for evidence in source_context["conflicts"] + source_context["warnings"]:
+        formal_validation["issues"].append({
+            "category": "surface_water_layout_basis_review",
+            "severity": "review",
+            "message": "正文采用用户指定的统一布设依据，项目材料依据或读取情况需人工核对。",
+            "evidence": evidence,
+            "recommendation": "核对实际监测布设依据后确认报告适用性。",
+        })
+    formal_validation["issue_count"] = len(formal_validation["issues"])
+    if source_context["conflicts"] or source_context["warnings"]:
+        formal_validation["valid"] = False
     write_formal_text_validation(DEBUG_DIR, formal_validation)
     doc = build_docx(table1, table2, table3, factor_list, evaluated_factors, texts, numbering)
     finalize_section_document(doc)
@@ -546,7 +560,7 @@ def build_rule_texts(
             f"根据项目所在区域的水文特征、河流水体规模，共计在评价范围设置了"
             f"{len(table1['rows'])}个监测断面进行水质监测。监测断面概况详见{monitor_points_label}。"
         ),
-        "monitoring_time_method_text": build_monitoring_description(table1, factor_list),
+        "monitoring_time_method_text": build_description(table1, factor_list, table2),
         "monitoring_result_text": build_surface_water_result_intro(table2, numbering),
         "evaluation_result_intro": f"地表水监测点位环境现状评价结果见{compliance_label}。",
         "conclusion": conclusion,
@@ -1319,6 +1333,8 @@ def polish_surface_water_text_with_llm(
         )
         polished_fields = {key: str(polished.get(key, "")).strip() for key in rule_texts}
         merged = ensure_surface_table_refs({**rule_texts, **polished_fields}, rule_texts, numbering)
+        # Keep the fixed basis, project facts and paragraph order deterministic.
+        merged["monitoring_time_method_text"] = rule_texts["monitoring_time_method_text"]
         validation = validate_polished_text(merged, rule_texts, results, numbering)
         write_json(DEBUG_DIR / "surface_water_llm_text_output.json", merged)
         write_json(DEBUG_DIR / "surface_water_llm_text_validation.json", validation)
@@ -1481,13 +1497,8 @@ def add_evaluation_method_text(doc: Document) -> None:
 
 
 def build_monitoring_description(table1: Dict[str, Any], factor_list: List[str]) -> str:
-    frequencies = unique_ordered(row.get("取样频次") for row in table1["rows"] if row.get("取样频次"))
-    frequency_text = "；".join(frequencies) if frequencies else "-"
-    factors = "、".join(factor_list)
-    return (
-        f"本次地表水现状监测断面按监测方案布设，取样频次为{frequency_text}。"
-        f"监测因子包括{factors}。各监测因子检测方法按监测报告及相关水质检测标准执行。"
-    )
+    return build_description(table1, factor_list)
+
 
 
 def sorted_point_codes(
