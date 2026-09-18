@@ -1,6 +1,7 @@
 import pytest
 
 from noise_section_generator import (
+    compute_point_metrics,
     infer_noise_frequency_from_records,
     clean_result_position,
     compose_plan_monitor_position,
@@ -116,3 +117,60 @@ def test_table_21_and_result_table_keep_second_row_context():
 )
 def test_monitor_position_composition_regressions(plan_position, report_text, expected):
     assert compose_plan_monitor_position(plan_position, report_text) == expected
+
+
+def _noise_plan():
+    return {
+        "point_code": "NJ1",
+        "standard_class": "2\u7c7b",
+        "standard_class_raw": "2\u7c7b",
+    }
+
+
+def _noise_record(period, laeq):
+    return {"period": period, "laeq": laeq}
+
+
+def test_noise_average_preserves_raw_decimals_and_rounds_final_average():
+    records = [
+        _noise_record("day", "58.4"),
+        _noise_record("day", "58.5"),
+        _noise_record("night", "49.4"),
+        _noise_record("night", "49.5"),
+    ]
+
+    result = compute_point_metrics(records, _noise_plan())
+
+    assert result["day1_day"] == "58.4"
+    assert result["day2_day"] == "58.5"
+    assert result["avg_day"] == "58.45"
+    assert result["avg_night"] == "49.45"
+
+
+def test_noise_average_uses_final_rounded_value_for_exceedance():
+    records = [
+        _noise_record("day", "60.004"),
+        _noise_record("day", "60.004"),
+        _noise_record("night", "50.004"),
+        _noise_record("night", "50.004"),
+    ]
+
+    result = compute_point_metrics(records, _noise_plan())
+
+    assert result["avg_day"] == "60"
+    assert result["avg_night"] == "50"
+    assert result["exceed_day"] == "0"
+    assert result["exceed_night"] == "0"
+
+
+def test_noise_average_excludes_missing_values_and_keeps_warnings():
+    result = compute_point_metrics(
+        [_noise_record("day", "58.4"), _noise_record("night", "49.5")],
+        _noise_plan(),
+    )
+
+    assert result["avg_day"] == "58.4"
+    assert result["avg_night"] == "49.5"
+    assert result["day2_day"] == "-"
+    assert result["day2_night"] == "-"
+    assert len(result["warnings"]) == 2
